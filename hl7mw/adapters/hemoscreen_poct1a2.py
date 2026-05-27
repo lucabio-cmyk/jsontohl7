@@ -294,6 +294,7 @@ class _Conversation:
         self._ctrl_gen: Iterator[int] = itertools.count(1)
         self._pending_end_ack = False    # True dopo che abbiamo inviato END.R01
         self._continuous_active = False  # True dopo aver avviato la modalità continua
+        self._ibuf = bytearray()
 
     # --- helpers interni ----------------------------------------------------
 
