@@ -19,3 +19,6 @@
 ## Phase 4
 - ASTM/POCT1 adapters SDK.
 - Multi-site governance, CAPA workflows, advanced analytics.
+
+## Architecture note
+- Vedi `PRODUCT_ARCHITECTURE_VISION.md` per proposta su struttura modulare, database multi-store, GUI e KPI.
