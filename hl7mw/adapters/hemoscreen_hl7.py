@@ -61,11 +61,11 @@ def _unescape_flag(val: str) -> str:
     return (val
             .replace(r"\~", "~")
             .replace(r"\^", "^")
-            .replace(r"\F\\", "|")
-            .replace(r"\S\\", "^")
-            .replace(r"\R\\", "~")
-            .replace(r"\T\\", "&")
-            .replace(r"\E\\", "\\"))
+            .replace("\\\\F\\\\", "|")
+            .replace("\\\\S\\\\", "^")
+            .replace("\\\\R\\\\", "~")
+            .replace("\\\\T\\\\", "&")
+            .replace("\\\\E\\\\", "\\\\"))
 
 
 # ---------------------------------------------------------------------------
