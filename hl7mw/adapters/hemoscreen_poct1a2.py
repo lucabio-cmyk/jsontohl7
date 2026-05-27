@@ -440,7 +440,7 @@ class _Conversation:
                 # ---- EVS.R01 (eventi strumento) -----------------------------
                 elif msg_type == "EVS.R01":
                     for evt in root.findall("EVT"):
-                        desc = _attr(evt.find("EVT.description"))
+                    for evt in root.findall(".//EVT"):
                         sev  = _attr(evt.find("EVT.severity_cd"))
                         num  = _attr(evt.find("EVT.number"))
                         LOG.info("POCT1-A2 evento %s [%s] #%s: %s",
