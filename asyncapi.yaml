@@ -1,0 +1,21 @@
+asyncapi: 2.6.0
+info:
+  title: POCT Middleware Events
+  version: 0.1.0
+channels:
+  poct.result.received:
+    publish:
+      message:
+        payload:
+          type: object
+          properties:
+            result_id: { type: string }
+            sample_key: { type: string }
+  poct.result.quarantined:
+    publish:
+      message:
+        payload:
+          type: object
+          properties:
+            result_id: { type: string }
+            reason: { type: string }
