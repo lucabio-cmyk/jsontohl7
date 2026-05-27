@@ -33,6 +33,7 @@ DEFAULTS = {
     "result_listen_host": "0.0.0.0", "result_listen_port": 6662,
     "lis_host": "127.0.0.1", "lis_port": 2575,
     "forward_interval_seconds": 10.0,
+    "ack_retry_attempts": 2,
     "status_host": "127.0.0.1", "status_port": 8080, "status_enabled": True,
     "sending_app": "HL7MW", "sending_facility": "MIDDLEWARE",
     "receiving_app": "LIS", "receiving_facility": "OSP",
@@ -67,7 +68,8 @@ def main(argv=None) -> int:
                                cfg["sending_app"], cfg["sending_facility"]).start()
     oru_cfg = hl7.OruConfig(cfg["sending_app"], cfg["sending_facility"],
                             cfg["receiving_app"], cfg["receiving_facility"])
-    forwarder = Forwarder(store, cfg["lis_host"], cfg["lis_port"], oru_cfg)
+    forwarder = Forwarder(store, cfg["lis_host"], cfg["lis_port"], oru_cfg,
+                          ack_retry_attempts=cfg.get("ack_retry_attempts", 2))
 
     status = None
     if cfg.get("status_enabled"):
