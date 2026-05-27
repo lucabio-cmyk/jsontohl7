@@ -23,6 +23,8 @@ from . import hl7
 from .store import Store
 from .pipeline import OrderReceiver, ResultReceiver, Forwarder
 from .webstatus import StatusServer
+from .adapters.hemoscreen_hl7 import HemoscreenHl7ResultReceiver
+from .adapters.hemoscreen_poct1a2 import HemoscreenPoct1A2Receiver
 
 LOG = logging.getLogger("hl7mw")
 _STOP = False
@@ -38,6 +40,16 @@ DEFAULTS = {
     "status_host": "127.0.0.1", "status_port": 8080, "status_enabled": True,
     "sending_app": "HL7MW", "sending_facility": "MIDDLEWARE",
     "receiving_app": "LIS", "receiving_facility": "OSP",
+    # Adapter HemoScreen HL7 v2.4
+    "hemoscreen_hl7_enabled": False,
+    "hemoscreen_hl7_host": "0.0.0.0",
+    "hemoscreen_hl7_port": 6663,
+    # Adapter HemoScreen POCT1-A2
+    "hemoscreen_poct1a2_enabled": False,
+    "hemoscreen_poct1a2_host": "0.0.0.0",
+    "hemoscreen_poct1a2_port": 6664,
+    "hemoscreen_poct1a2_continuous_mode": False,
+    "hemoscreen_poct1a2_timeout": 65.0,
 }
 
 
@@ -78,6 +90,26 @@ def main(argv=None) -> int:
         status = StatusServer(store, cfg["status_host"], cfg["status_port"]).start()
         LOG.info("Status UI su http://%s:%s", cfg["status_host"], cfg["status_port"])
 
+    hs_hl7 = None
+    if cfg.get("hemoscreen_hl7_enabled"):
+        hs_hl7 = HemoscreenHl7ResultReceiver(
+            store,
+            cfg["hemoscreen_hl7_host"],
+            cfg["hemoscreen_hl7_port"],
+            cfg["sending_app"],
+            cfg["sending_facility"],
+        ).start()
+
+    hs_poct = None
+    if cfg.get("hemoscreen_poct1a2_enabled"):
+        hs_poct = HemoscreenPoct1A2Receiver(
+            store,
+            cfg["hemoscreen_poct1a2_host"],
+            cfg["hemoscreen_poct1a2_port"],
+            continuous_mode=cfg["hemoscreen_poct1a2_continuous_mode"],
+            timeout=cfg["hemoscreen_poct1a2_timeout"],
+        ).start()
+
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
     LOG.info("Middleware avviato. Ctrl-C per fermare.")
@@ -97,6 +129,10 @@ def main(argv=None) -> int:
         result_rx.stop()
         if status:
             status.stop()
+        if hs_hl7:
+            hs_hl7.stop()
+        if hs_poct:
+            hs_poct.stop()
         LOG.info("Middleware arrestato.")
     return 0
 

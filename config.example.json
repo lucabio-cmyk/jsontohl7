@@ -20,5 +20,17 @@
   "sending_app": "HL7MW",
   "sending_facility": "MIDDLEWARE",
   "receiving_app": "LIS",
-  "receiving_facility": "OSP"
+  "receiving_facility": "OSP",
+
+  "_comment_hemoscreen": "Adapter PixCell HemoScreen — abilitare uno solo tra hl7 e poct1a2 per strumento",
+
+  "hemoscreen_hl7_enabled": false,
+  "hemoscreen_hl7_host": "0.0.0.0",
+  "hemoscreen_hl7_port": 6663,
+
+  "hemoscreen_poct1a2_enabled": false,
+  "hemoscreen_poct1a2_host": "0.0.0.0",
+  "hemoscreen_poct1a2_port": 6664,
+  "hemoscreen_poct1a2_continuous_mode": false,
+  "hemoscreen_poct1a2_timeout": 65.0
 }
