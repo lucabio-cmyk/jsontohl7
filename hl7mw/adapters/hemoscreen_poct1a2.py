@@ -59,13 +59,7 @@ LOG = logging.getLogger("hl7mw")
 
 def _now_iso() -> str:
     """Timestamp locale in formato ISO 8601 con offset timezone (es. 2024-01-03T12:00:00+01:00)."""
-    now = _dt.datetime.now(_dt.timezone.utc).astimezone()
-    off = now.utcoffset()
-    total_secs = int(off.total_seconds())  # type: ignore[union-attr]
-    sign = "+" if total_secs >= 0 else "-"
-    total_secs = abs(total_secs)
-    hh, mm = divmod(total_secs // 60, 60)
-    return now.strftime(f"%Y-%m-%dT%H:%M:%S{sign}{hh:02d}:{mm:02d}")
+    return _dt.datetime.now(_dt.timezone.utc).astimezone().replace(microsecond=0).isoformat()
 
 
 # ---------------------------------------------------------------------------
