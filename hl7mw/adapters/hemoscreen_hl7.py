@@ -103,11 +103,13 @@ def parse_hemoscreen_hl7(message: str) -> dict:
     # --- NTE tra OBR e primo OBX (commento accept) --------------------------
     obr_idx   = next((i for i, s in enumerate(segs) if s[0] == "OBR"), -1)
     first_obx = next((i for i, s in enumerate(segs) if s[0] == "OBX"), len(segs))
-    obr_notes = [
-        hl7.get(segs[i], 3)
-        for i in range(obr_idx + 1, first_obx)
-        if segs[i][0] == "NTE"
-    ]
+    obr_notes = []
+    if obr_idx != -1:
+        obr_notes = [
+            hl7.get(segs[i], 3)
+            for i in range(obr_idx + 1, first_obx)
+            if segs[i][0] == "NTE"
+        ]
 
     # --- OBX (+ NTE seguenti) -----------------------------------------------
     results: list[dict] = []
