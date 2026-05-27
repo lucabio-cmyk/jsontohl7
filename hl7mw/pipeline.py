@@ -13,6 +13,7 @@ si confronta l'elenco dei test richiesti (universal_service_id / OBR) con quelli
 from __future__ import annotations
 
 import logging
+import time
 
 from . import hl7, mllp
 from .store import Store
@@ -112,12 +113,14 @@ class Forwarder:
     def __init__(self, store: Store, lis_host: str, lis_port: int,
                  oru_cfg: hl7.OruConfig | None = None,
                  connect_timeout: float = 10.0, read_timeout: float = 30.0,
-                 ack_retry_attempts: int = 0):
+                 ack_retry_attempts: int = 0,
+                 ack_retry_backoff_seconds: float = 0.0):
         self.store = store
         self.lis_host, self.lis_port = lis_host, lis_port
         self.cfg = oru_cfg or hl7.OruConfig()
         self.connect_timeout, self.read_timeout = connect_timeout, read_timeout
         self.ack_retry_attempts = max(0, int(ack_retry_attempts))
+        self.ack_retry_backoff_seconds = max(0.0, float(ack_retry_backoff_seconds))
 
     def forward_ready(self) -> dict:
         counts = {"sent": 0, "error": 0, "skipped": 0}
@@ -146,8 +149,11 @@ class Forwarder:
                     except mllp.MllpError:
                         if attempt >= self.ack_retry_attempts:
                             raise
-                        LOG.warning("Inoltro sample=%s fallito (tentativo %d/%d), ritento.",
-                                    key, attempt + 1, self.ack_retry_attempts + 1)
+                        delay = self.ack_retry_backoff_seconds * (2 ** attempt)
+                        LOG.warning("Inoltro sample=%s fallito (tentativo %d/%d), ritento tra %.2fs.",
+                                    key, attempt + 1, self.ack_retry_attempts + 1, delay)
+                        if delay > 0:
+                            time.sleep(delay)
             except mllp.MllpError as e:
                 # transitorio: torna READY, ritentabile
                 self.store.set_status(key, "READY", f"transient: {e}")
