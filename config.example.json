@@ -10,6 +10,7 @@
   "lis_host": "10.8.0.10",
   "lis_port": 2575,
   "forward_interval_seconds": 10.0,
+  "ack_retry_attempts": 2,
 
   "status_enabled": true,
   "status_host": "127.0.0.1",

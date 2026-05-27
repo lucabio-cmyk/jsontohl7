@@ -49,9 +49,11 @@ python3 tests/test_e2e.py
 ## Stato attuale e prossimi passi
 
 Funzionante e testato: ricezione ordini, ricezione/associazione risultati, inoltro al LIS
-con ACK, gestione risultati orfani, dashboard di stato di sola lettura.
+con ACK (inclusi retry automatici su errori transitori), gestione risultati orfani,
+dashboard di stato di sola lettura.
 
 Da sviluppare (vedi `ARCHITECTURE.md` → Roadmap): adapter **ASTM** per gli strumenti che
 non parlano HL7, regola di completezza basata sui test richiesti, retry/backoff persistente
+con policy avanzata (es. exponential backoff e limite giornaliero),
 nell'inoltro, e la **UI completa** (coda ordini, dettaglio, riassociazione orfani, azioni
 retry/forza-inoltro) sopra `store.py`.

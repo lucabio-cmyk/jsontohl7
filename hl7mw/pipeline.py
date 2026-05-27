@@ -111,11 +111,13 @@ class Forwarder:
     """Prende gli ordini READY, costruisce l'ORU e lo invia al LIS gestendo l'ACK."""
     def __init__(self, store: Store, lis_host: str, lis_port: int,
                  oru_cfg: hl7.OruConfig | None = None,
-                 connect_timeout: float = 10.0, read_timeout: float = 30.0):
+                 connect_timeout: float = 10.0, read_timeout: float = 30.0,
+                 ack_retry_attempts: int = 0):
         self.store = store
         self.lis_host, self.lis_port = lis_host, lis_port
         self.cfg = oru_cfg or hl7.OruConfig()
         self.connect_timeout, self.read_timeout = connect_timeout, read_timeout
+        self.ack_retry_attempts = max(0, int(ack_retry_attempts))
 
     def forward_ready(self) -> dict:
         counts = {"sent": 0, "error": 0, "skipped": 0}
@@ -133,10 +135,19 @@ class Forwarder:
                 continue
             self.store.set_status(key, "FORWARDING")
             try:
-                code = mllp.send_message(self.lis_host, self.lis_port, message,
-                                         expected_control_id=cid,
-                                         connect_timeout=self.connect_timeout,
-                                         read_timeout=self.read_timeout)
+                code = ""
+                for attempt in range(self.ack_retry_attempts + 1):
+                    try:
+                        code = mllp.send_message(self.lis_host, self.lis_port, message,
+                                                 expected_control_id=cid,
+                                                 connect_timeout=self.connect_timeout,
+                                                 read_timeout=self.read_timeout)
+                        break
+                    except mllp.MllpError:
+                        if attempt >= self.ack_retry_attempts:
+                            raise
+                        LOG.warning("Inoltro sample=%s fallito (tentativo %d/%d), ritento.",
+                                    key, attempt + 1, self.ack_retry_attempts + 1)
             except mllp.MllpError as e:
                 # transitorio: torna READY, ritentabile
                 self.store.set_status(key, "READY", f"transient: {e}")
