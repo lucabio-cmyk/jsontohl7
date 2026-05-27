@@ -251,12 +251,19 @@ def _xml_start_continuous(ctrl_id: str) -> str:
 # Trasporto: framing MLLP su TCP (riuso costanti da mllp.py)
 # ---------------------------------------------------------------------------
 
-def _mllp_recv(sock: socket.socket, timeout: float = 65.0) -> bytes:
+def _mllp_recv(sock: socket.socket, timeout: float = 65.0, buf: bytearray | None = None) -> bytes:
     """Legge un frame MLLP (0x0B…0x1C) dal socket. Ritorna b"" su connessione chiusa/timeout."""
     sock.settimeout(timeout)
-    buf = bytearray()
-    started = False
+    if buf is None:
+        buf = bytearray()
     while True:
+        if SB[0] in buf:
+            sb_idx = buf.index(SB[0])
+            if EB[0] in buf[sb_idx:]:
+                eb_idx = buf.index(EB[0], sb_idx)
+                data = buf[sb_idx + 1:eb_idx]
+                del buf[:eb_idx + 1]
+                return bytes(data)
         try:
             chunk = sock.recv(4096)
         except socket.timeout:
@@ -264,12 +271,6 @@ def _mllp_recv(sock: socket.socket, timeout: float = 65.0) -> bytes:
         if not chunk:
             return b""
         buf.extend(chunk)
-        if not started and SB[0] in buf:
-            started = True
-            del buf[: buf.index(SB[0]) + 1]
-        if started and EB[0] in buf:
-            return bytes(buf[: buf.index(EB[0])])
-
 
 def _mllp_send(sock: socket.socket, xml_str: str) -> None:
     """Invia un frame MLLP con contenuto XML."""
