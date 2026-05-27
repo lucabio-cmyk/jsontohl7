@@ -95,16 +95,35 @@ class ResultReceiver:
 
 
 def try_complete(store: Store, sample_key: str) -> None:
-    """Regola di completezza (adattare). Qui: ordine + >=1 risultato => READY."""
+    """Regola di completezza (adattare). Qui: ordine + >=1 risultato => READY/QUARANTINED."""
     order = store.get_order(sample_key)
     if not order:
         return
-    if order["status"] in ("READY", "FORWARDING", "SENT"):
+    if order["status"] in ("READY", "FORWARDING", "SENT", "QUARANTINED"):
         return
-    if store.results_for(sample_key):
+    results = store.results_for(sample_key)
+    if results:
+        if _is_qc_blocked(results):
+            store.set_status(sample_key, "QUARANTINED", "QC failed/expired")
+            LOG.warning("Ordine in quarantena per blocco QC: sample=%s", sample_key)
+            return
         store.set_status(sample_key, "READY")
         LOG.info("Ordine pronto per l'inoltro: sample=%s", sample_key)
     # senza risultati l'ordine resta nello stato corrente (RECEIVED): in attesa.
+
+
+def _is_qc_blocked(results: list[dict]) -> bool:
+    """Ritorna True se un risultato indica QC failed/expired."""
+    blocked = {"FAILED", "EXPIRED"}
+    for result in results:
+        qc = str(result.get("qc_status", "")).upper()
+        if qc in blocked:
+            return True
+        for analyte in result.get("results", []):
+            aqc = str(analyte.get("qc_status", "")).upper()
+            if aqc in blocked:
+                return True
+    return False
 
 
 # --------------------------------------------------------------------------- 3) inoltro al LIS
