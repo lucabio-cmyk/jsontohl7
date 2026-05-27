@@ -1,0 +1,26 @@
+openapi: 3.0.3
+info:
+  title: POCT Middleware API
+  version: 0.1.0
+paths:
+  /results:
+    get:
+      summary: List results
+      responses:
+        '200':
+          description: OK
+  /results/{id}/validate:
+    post:
+      summary: Manual validation action
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Updated }
+  /audit-events:
+    get:
+      summary: List audit events
+      responses:
+        '200': { description: OK }
