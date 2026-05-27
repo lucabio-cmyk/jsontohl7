@@ -306,7 +306,7 @@ class _Conversation:
 
     def _recv(self) -> tuple[str | None, ET.Element | None]:
         """Riceve il prossimo messaggio XML. Ritorna (tipo_msg, root) o (None, None)."""
-        raw = _mllp_recv(self._sock, self._timeout)
+        raw = _mllp_recv(self._sock, self._timeout, self._ibuf)
         if not raw:
             return None, None
 
