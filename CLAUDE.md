@@ -26,12 +26,55 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
   nel package `hl7mw/` senza prima discuterne (UI e tooling di sviluppo possono usarle).
 - Prima di modificare il parsing HL7, aggiungi un test in `tests/` che riproduce il caso.
 
+## Nuove Features (v2 — Sistema di Gestione & Monitoring)
+
+### Database Esteso
+- **`instruments`**: tracciamento device collegati con heartbeat, status (ONLINE/OFFLINE/UNKNOWN), msg count
+- **`audit_log`**: log immutabile per tracciabilità clinica (events, severity, timestamp)
+- **`order_timing`**: timing di ogni ordine (received, first_result, ready, sent) → metriche dashboard
+- **`orders.source_instrument`**: associazione ordine al device sorgente
+- Colonne estese su `results` e `unmatched_results` per source_instrument
+
+### REST API (FastAPI)
+- Endpoint `/api/dashboard` — statistiche globali (throughput, timing medio, status instrument)
+- Endpoint `/api/orders` — lista ordini con filtri e dettaglio completo
+- Endpoint `/api/orders/{sample_key}/retry` — riporta ERROR → READY
+- Endpoint `/api/orders/{sample_key}/cancel` — annulla ordine
+- Endpoint `/api/instruments` — status tutti device
+- Endpoint `/api/unmatched` — risultati orfani + `/match` per riconciliazione manuale
+- Endpoint `/api/audit-log` — log tracciabilità (filtri per sample/event)
+- **Dashboard HTML moderna**: Chart.js (doughnut chart status, metriche KPI, tabelle ordini, azioni, device status)
+
+Abilitazione: `"api_enabled": true` in config, oppure `pip install fastapi uvicorn`
+
+### CLI Tool (`python3 -m hl7mw.cli`)
+```bash
+# Elenco ordini
+python3 -m hl7mw.cli --db hl7mw.db orders [--status READY|ERROR|SENT]
+# Dettaglio ordine con risultati e timing
+python3 -m hl7mw.cli --db hl7mw.db order ABC123
+# Operazioni
+python3 -m hl7mw.cli --db hl7mw.db retry ABC123    # ripeti inoltro (ERROR→READY)
+python3 -m hl7mw.cli --db hl7mw.db cancel ABC123   # annulla ordine
+# Audit & stats
+python3 -m hl7mw.cli --db hl7mw.db audit-log [--sample-key S] [--event-type X] [--limit 100]
+python3 -m hl7mw.cli --db hl7mw.db instruments     # elenco device
+python3 -m hl7mw.cli --db hl7mw.db stats           # statistiche globali
+python3 -m hl7mw.cli --db hl7mw.db unmatched       # risultati orfani
+```
+
+### Device Monitoring (`monitor.py`)
+- **`DeviceMonitor`** integrato nei Receiver: registra heartbeat ad ogni messaggio
+- Aggiorna status ONLINE/OFFLINE basato su timeout (config: `device_offline_timeout_seconds`)
+- Traccia msg count per device
+- Audit log per cambio status (INFO online, WARNING offline)
+
 ## Da fare (priorità)
 1. Adapter **ASTM E1381/E1394** per strumenti non-HL7 → produrre lo stesso dict di
    `hl7.parse_result`.
 2. Regola di **completezza** reale in `pipeline.try_complete` (test richiesti vs ricevuti).
-3. **Retry/backoff persistente** nel `Forwarder`.
-4. **UI**: API REST (es. FastAPI) sopra `store.py` + frontend; sostituire `webstatus.py`.
+3. **Retry/backoff persistente** nel `Forwarder` (storico retry, DLQ).
+4. **Sicurezza**: TLS sul MLLP, autenticazione API, RBAC dashboard.
 
 ## Attenzione (dominio sanitario)
 Dati clinici reali: niente dati paziente nei log/commit, attenzione a sicurezza del

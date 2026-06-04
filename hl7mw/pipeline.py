@@ -17,6 +17,7 @@ import time
 
 from . import hl7, mllp
 from .store import Store
+from .monitor import DeviceMonitor
 
 LOG = logging.getLogger("hl7mw")
 
@@ -24,10 +25,12 @@ LOG = logging.getLogger("hl7mw")
 # --------------------------------------------------------------------------- 1) ordini dal LIS
 class OrderReceiver:
     def __init__(self, store: Store, host: str, port: int,
-                 sending_app="HL7MW", sending_facility="MIDDLEWARE"):
+                 sending_app="HL7MW", sending_facility="MIDDLEWARE",
+                 monitor: DeviceMonitor | None = None):
         self.store = store
         self.host, self.port = host, port
         self.sending_app, self.sending_facility = sending_app, sending_facility
+        self.monitor = monitor
         self._server: mllp.MllpServer | None = None
 
     def _handle(self, message: str) -> str:
@@ -40,6 +43,9 @@ class OrderReceiver:
             return hl7.build_ack(message, "AR", "Nessun identificativo campione/ordine",
                                  self.sending_app, self.sending_facility)
         self.store.upsert_order(order)
+        self.store.record_timing(order["sample_key"], "received")
+        self.store.audit_log("order_received", sample_key=order["sample_key"],
+                            details=f"Test: {order['universal_service_id'].get('text')}")
         # se erano gia' arrivati risultati prima dell'ordine, riconcilia
         try_complete(self.store, order["sample_key"])
         LOG.info("Ordine ricevuto dal LIS: sample=%s test=%s",
@@ -59,10 +65,12 @@ class OrderReceiver:
 # --------------------------------------------------------------------------- 2) risultati dagli strumenti
 class ResultReceiver:
     def __init__(self, store: Store, host: str, port: int,
-                 sending_app="HL7MW", sending_facility="MIDDLEWARE"):
+                 sending_app="HL7MW", sending_facility="MIDDLEWARE",
+                 monitor: DeviceMonitor | None = None):
         self.store = store
         self.host, self.port = host, port
         self.sending_app, self.sending_facility = sending_app, sending_facility
+        self.monitor = monitor
         self._server: mllp.MllpServer | None = None
 
     def _handle(self, message: str) -> str:
@@ -71,14 +79,32 @@ class ResultReceiver:
         except hl7.Hl7Error as e:
             LOG.warning("Risultato non valido rifiutato: %s", e)
             return hl7.build_ack(message, "AR", str(e), self.sending_app, self.sending_facility)
+
         key = result["sample_key"]
         order = self.store.get_order(key) if key else None
+
+        # Registra heartbeat dello strumento
+        device_name = result.get("sending_application", "UNKNOWN")
+        if self.monitor:
+            self.monitor.record_message(device_name)
+
         if not order:
             self.store.add_unmatched(result)
+            self.store.audit_log("result_unmatched", sample_key=key,
+                                instrument=device_name,
+                                details=f"No matching order")
             LOG.warning("Risultato senza ordine corrispondente: sample=%s -> unmatched", key)
-            # ACK comunque positivo: lo strumento ha consegnato; gestiamo noi l'orfano
             return hl7.build_ack(message, "AA", "", self.sending_app, self.sending_facility)
+
         self.store.add_result(key, result)
+        timing = self.store.get_timing(key)
+        if not timing or not timing.get("first_result_at"):
+            self.store.record_timing(key, "first_result")
+
+        self.store.audit_log("result_received", sample_key=key,
+                            instrument=device_name,
+                            details=f"{len(result['results'])} analytes")
+
         try_complete(self.store, key)
         LOG.info("Risultato associato all'ordine: sample=%s (%d analiti)",
                  key, len(result["results"]))
@@ -103,6 +129,9 @@ def try_complete(store: Store, sample_key: str) -> None:
         return
     if store.results_for(sample_key):
         store.set_status(sample_key, "READY")
+        store.record_timing(sample_key, "ready")
+        store.audit_log("order_ready", sample_key=sample_key,
+                       details="All required results received")
         LOG.info("Ordine pronto per l'inoltro: sample=%s", sample_key)
     # senza risultati l'ordine resta nello stato corrente (RECEIVED): in attesa.
 
@@ -166,6 +195,8 @@ class Forwarder:
                 LOG.error("Inoltro sample=%s rifiutato dal LIS: %s", key, e)
                 continue
             self.store.set_status(key, "SENT")
+            self.store.record_timing(key, "sent")
+            self.store.audit_log("order_sent", sample_key=key, details=f"ACK {code} from LIS")
             counts["sent"] += 1
             LOG.info("Inoltrato al LIS sample=%s (ACK %s)", key, code)
         return counts
