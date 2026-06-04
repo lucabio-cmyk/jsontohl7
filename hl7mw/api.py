@@ -54,7 +54,7 @@ async def get_dashboard():
 
 
 @app.get("/api/orders")
-async def list_orders(
+def list_orders(
     status: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
