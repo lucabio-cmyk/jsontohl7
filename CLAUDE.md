@@ -69,12 +69,42 @@ python3 -m hl7mw.cli --db hl7mw.db unmatched       # risultati orfani
 - Traccia msg count per device
 - Audit log per cambio status (INFO online, WARNING offline)
 
+### Operatori & Autorizzazioni — RBAC (`auth.py`)
+- **`auth.py`** (solo stdlib): ruoli, permessi, hashing PBKDF2-HMAC-SHA256, token.
+- Ruoli: `ADMIN` (tutto), `SUPERVISOR` (ordini + config device + operatori),
+  `OPERATOR` (ordini + view), `VIEWER` (sola lettura). Gerarchia: un ruolo non
+  può gestire operatori di rango superiore (`auth.can_manage_operator`).
+- Doppia identità nell'operatore: ruolo **RBAC middleware** + permesso **POCT**
+  (livello del device, usato nella lista operatori inviata all'HemoScreen).
+- Tabelle `operators`, `operator_sessions` in `store.py`; lockout dopo 5 tentativi.
+- **API**: `POST /api/auth/login|logout`, `GET /api/auth/me`, CRUD `/api/operators`
+  (+ `/password`, `/active`, `/unlock`). Token via header `Authorization: Bearer`.
+  Endpoint protetti da permessi; **bootstrap mode**: finché non esiste alcun
+  operatore l'API resta aperta per creare il primo admin.
+- **CLI**: `operators`, `operator-add`, `operator-passwd`, `operator-remove`,
+  `operator-unlock`.
+- **Bootstrap**: al primo avvio `run.py` crea l'admin (`bootstrap_admin_id/password`).
+
+### Configurazione remota HemoScreen (`adapters/hemoscreen_config.py`)
+- **Catalogo parametri** (`CONFIG_CATALOG`): continuous_mode, operator_auth_required,
+  patient_id_required, auto_transmit, qc_lockout_enabled, qc_interval_hours,
+  application_timeout_seconds, keepalive_interval_seconds, result_units, language,
+  date_format, reference_profile — con tipo, default, range e validazione.
+- **Builder POCT1-A2**: `build_config_directive` (DTV.R01 / SET_CONFIG),
+  `build_operator_list` (OPL.R01, operatori autorizzati con livello e validità).
+- Persistenza in `device_config` + history (`device_config_history`).
+- Il `HemoscreenPoct1A2Receiver` invia config/lista operatori su richiesta del
+  device (`REQ.R01` ROPL/RDCF) o all'handshake se `push_config_on_connect=true`.
+- **API**: `GET/PUT /api/instruments/{name}/config`, `/config/history`,
+  `/config/preview`, `GET /api/config/catalog`.
+- **CLI**: `device-config <strumento> [--set chiave=valore ...]`.
+
 ## Da fare (priorità)
 1. Adapter **ASTM E1381/E1394** per strumenti non-HL7 → produrre lo stesso dict di
    `hl7.parse_result`.
 2. Regola di **completezza** reale in `pipeline.try_complete` (test richiesti vs ricevuti).
 3. **Retry/backoff persistente** nel `Forwarder` (storico retry, DLQ).
-4. **Sicurezza**: TLS sul MLLP, autenticazione API, RBAC dashboard.
+4. **Sicurezza**: TLS sul MLLP (✓ autenticazione API + RBAC dashboard fatti in `auth.py`).
 
 ## Attenzione (dominio sanitario)
 Dati clinici reali: niente dati paziente nei log/commit, attenzione a sicurezza del

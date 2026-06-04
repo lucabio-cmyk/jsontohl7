@@ -50,8 +50,39 @@ from .. import hl7 as hl7mod
 from ..mllp import SB, EB, CR
 from ..pipeline import try_complete
 from ..store import Store
+from . import hemoscreen_config
 
 LOG = logging.getLogger("hl7mw")
+
+
+class HemoscreenConfigProvider:
+    """Fornisce alla conversazione POCT1-A2 i messaggi di configurazione remota.
+
+    Costruisce, leggendo dallo store, l'OPL.R01 (lista operatori autorizzati) e il
+    DTV.R01 SET_CONFIG (parametri del device). È il punto di aggancio tra la
+    configurazione persistita (operatori + device_config) e il protocollo.
+    """
+
+    def __init__(self, store: Store, instrument_name: str):
+        self.store = store
+        self.instrument_name = instrument_name
+
+    def operator_list_xml(self, ctrl_id: str) -> str:
+        operators = self.store.list_operators()
+        return hemoscreen_config.build_operator_list(operators, ctrl_id)
+
+    def config_xml(self, ctrl_id: str) -> str | None:
+        """DTV.R01 con i parametri salvati per lo strumento, o None se non configurato."""
+        params = self.store.get_device_config(self.instrument_name)
+        if not params:
+            return None
+        return hemoscreen_config.build_config_directive(params, ctrl_id)
+
+    def is_operator_authorized(self, operator_id: str) -> bool:
+        if not operator_id:
+            return False
+        op = self.store.get_operator(operator_id)
+        return bool(op and op.get("active") and not op.get("locked"))
 
 # ---------------------------------------------------------------------------
 # Helpers timestamp
@@ -279,15 +310,20 @@ class _Conversation:
     """Gestisce una singola conversazione POCT1-A2 su una connessione TCP persistente."""
 
     def __init__(self, sock: socket.socket, addr: tuple,
-                 store: Store, continuous_mode: bool, timeout: float):
+                 store: Store, continuous_mode: bool, timeout: float,
+                 config_provider: "HemoscreenConfigProvider | None" = None,
+                 push_config_on_connect: bool = False):
         self._sock = sock
         self._addr = addr
         self._store = store
         self._continuous_mode = continuous_mode
         self._timeout = timeout
+        self._config = config_provider
+        self._push_config_on_connect = push_config_on_connect
         self._ctrl_gen: Iterator[int] = itertools.count(1)
         self._pending_end_ack = False    # True dopo che abbiamo inviato END.R01
         self._continuous_active = False  # True dopo aver avviato la modalità continua
+        self._config_pushed = False      # True dopo aver spinto config/operatori
         self._ibuf = bytearray()
 
     # --- helpers interni ----------------------------------------------------
@@ -342,6 +378,21 @@ class _Conversation:
                 len(result.get("results", [])),
             )
 
+    def _push_remote_config(self) -> None:
+        """Invia al device la lista operatori e la configurazione salvata (se presenti)."""
+        if not self._config or self._config_pushed:
+            return
+        self._config_pushed = True
+        try:
+            self._send(self._config.operator_list_xml(self._next_ctrl()))
+            LOG.info("POCT1-A2 %s: inviata lista operatori", self._addr)
+            cfg_xml = self._config.config_xml(self._next_ctrl())
+            if cfg_xml:
+                self._send(cfg_xml)
+                LOG.info("POCT1-A2 %s: inviata configurazione remota", self._addr)
+        except Exception:
+            LOG.exception("POCT1-A2 %s: errore invio configurazione remota", self._addr)
+
     # --- loop principale ---------------------------------------------------
 
     def run(self) -> None:
@@ -365,6 +416,24 @@ class _Conversation:
                 if msg_type == "HEL.R01":
                     LOG.debug("POCT1-A2 %s: HEL.R01", self._addr)
                     self._send(_xml_ack(self._next_ctrl(), ctrl_id))
+                    if self._push_config_on_connect:
+                        self._push_remote_config()
+
+                # ---- REQ.R01 (richiesta del device) -------------------------
+                # ROPL = request operator list, RDCF/RCFG = request device config.
+                elif msg_type == "REQ.R01":
+                    req = root.find("REQ")
+                    req_cd = _attr(req.find("REQ.request_cd") if req is not None else None)
+                    LOG.debug("POCT1-A2 %s: REQ.R01 cd=%s", self._addr, req_cd)
+                    self._send(_xml_ack(self._next_ctrl(), ctrl_id))
+                    if self._config and req_cd == "ROPL":
+                        self._send(self._config.operator_list_xml(self._next_ctrl()))
+                        LOG.info("POCT1-A2 %s: lista operatori su richiesta", self._addr)
+                    elif self._config and req_cd in ("RDCF", "RCFG"):
+                        cfg_xml = self._config.config_xml(self._next_ctrl())
+                        if cfg_xml:
+                            self._send(cfg_xml)
+                            LOG.info("POCT1-A2 %s: configurazione su richiesta", self._addr)
 
                 # ---- DST.R01 ------------------------------------------------
                 elif msg_type == "DST.R01":
@@ -481,11 +550,16 @@ class HemoscreenPoct1A2Receiver:
     """
 
     def __init__(self, store: Store, host: str, port: int,
-                 continuous_mode: bool = False, timeout: float = 65.0):
+                 continuous_mode: bool = False, timeout: float = 65.0,
+                 instrument_name: str = "HEMOSCREEN-POCT",
+                 push_config_on_connect: bool = False):
         self.store = store
         self.host, self.port = host, port
         self.continuous_mode = continuous_mode
         self.timeout = timeout
+        self.instrument_name = instrument_name
+        self.push_config_on_connect = push_config_on_connect
+        self.config_provider = HemoscreenConfigProvider(store, instrument_name)
         self._srv: socketserver.ThreadingTCPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -500,6 +574,8 @@ class HemoscreenPoct1A2Receiver:
                     outer.store,
                     outer.continuous_mode,
                     outer.timeout,
+                    config_provider=outer.config_provider,
+                    push_config_on_connect=outer.push_config_on_connect,
                 )
                 conv.run()
 

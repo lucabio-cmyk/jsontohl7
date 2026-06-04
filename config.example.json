@@ -38,5 +38,11 @@
   "hemoscreen_poct1a2_host": "0.0.0.0",
   "hemoscreen_poct1a2_port": 6664,
   "hemoscreen_poct1a2_continuous_mode": false,
-  "hemoscreen_poct1a2_timeout": 65.0
+  "hemoscreen_poct1a2_timeout": 65.0,
+  "hemoscreen_poct1a2_instrument_name": "HEMOSCREEN-POCT",
+  "hemoscreen_poct1a2_push_config_on_connect": false,
+
+  "_comment_operatori": "Bootstrap operatore amministratore: creato al primo avvio se il DB non ha operatori. Lasciare la password vuota e impostarla con `python3 -m hl7mw.cli operator-passwd admin`.",
+  "bootstrap_admin_id": "admin",
+  "bootstrap_admin_password": ""
 }

@@ -9,11 +9,14 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
 from pathlib import Path
 
+from . import auth
 from .store import Store
+from .adapters import hemoscreen_config
 
 
 def cmd_orders(args, store: Store):
@@ -156,6 +159,110 @@ def cmd_unmatched(args, store: Store):
     return 0
 
 
+def cmd_operators(args, store: Store):
+    """Elenco operatori."""
+    operators = store.list_operators(active_only=args.active_only)
+    print(f"Operatori totali: {len(operators)}")
+    for o in operators:
+        state = "BLOCCATO" if o["locked"] else ("attivo" if o["active"] else "inattivo")
+        print(f"  {o['operator_id']:20} {o['full_name']:25} {o['role']:12} "
+              f"poct={o.get('poct_permission', '-'):10} {state}")
+    return 0
+
+
+def cmd_operator_add(args, store: Store):
+    """Crea o aggiorna un operatore."""
+    if not auth.is_valid_role(args.role):
+        print(f"Ruolo non valido: {args.role}. Ammessi: {', '.join(auth.ROLES)}")
+        return 1
+    password = args.password
+    if args.ask_password:
+        password = getpass.getpass("Password / PIN: ")
+        if password != getpass.getpass("Conferma: "):
+            print("Le password non coincidono.")
+            return 1
+    store.upsert_operator(
+        args.operator_id, args.full_name, role=args.role, password=password or None,
+        poct_permission=args.poct_permission,
+        certifications=args.certification or None,
+        valid_from=args.valid_from, valid_until=args.valid_until,
+        active=not args.inactive,
+    )
+    store.audit_log("cli_operator_upsert",
+                    details=f"operator={args.operator_id} role={args.role}")
+    print(f"Operatore {args.operator_id} salvato (ruolo {args.role}).")
+    return 0
+
+
+def cmd_operator_passwd(args, store: Store):
+    """Imposta/cambia la password di un operatore."""
+    if not store.get_operator(args.operator_id):
+        print(f"Operatore non trovato: {args.operator_id}")
+        return 1
+    password = args.password
+    if not password:
+        password = getpass.getpass("Nuova password / PIN: ")
+        if password != getpass.getpass("Conferma: "):
+            print("Le password non coincidono.")
+            return 1
+    store.set_operator_password(args.operator_id, password)
+    store.audit_log("cli_operator_password_change", details=f"operator={args.operator_id}")
+    print(f"Password aggiornata per {args.operator_id}.")
+    return 0
+
+
+def cmd_operator_remove(args, store: Store):
+    """Elimina un operatore."""
+    if store.delete_operator(args.operator_id):
+        store.audit_log("cli_operator_delete", details=f"operator={args.operator_id}",
+                        severity="WARNING")
+        print(f"Operatore {args.operator_id} eliminato.")
+        return 0
+    print(f"Operatore non trovato: {args.operator_id}")
+    return 1
+
+
+def cmd_operator_unlock(args, store: Store):
+    """Sblocca un operatore bloccato per troppi tentativi falliti."""
+    if store.set_operator_locked(args.operator_id, False):
+        store.audit_log("cli_operator_unlock", details=f"operator={args.operator_id}")
+        print(f"Operatore {args.operator_id} sbloccato.")
+        return 0
+    print(f"Operatore non trovato: {args.operator_id}")
+    return 1
+
+
+def cmd_device_config(args, store: Store):
+    """Mostra o aggiorna la configurazione remota di uno strumento."""
+    if args.set:
+        params = {}
+        for pair in args.set:
+            if "=" not in pair:
+                print(f"Formato atteso chiave=valore: {pair!r}")
+                return 1
+            k, v = pair.split("=", 1)
+            params[k.strip()] = v.strip()
+        try:
+            canonical = hemoscreen_config.validate_config(params)
+        except hemoscreen_config.ConfigError as e:
+            print(f"Configurazione non valida: {e}")
+            return 1
+        store.set_device_config(args.instrument, canonical, updated_by="cli")
+        store.audit_log("cli_device_config_change", instrument=args.instrument,
+                        details=f"params={','.join(canonical)}")
+        print(f"Configurazione aggiornata per {args.instrument}.")
+
+    saved = store.get_device_config(args.instrument)
+    merged = hemoscreen_config.default_config()
+    merged.update(saved)
+    print(f"Configurazione {args.instrument} (default + override):")
+    for key, spec in hemoscreen_config.CONFIG_CATALOG.items():
+        marker = "*" if key in saved else " "
+        print(f" {marker} {key:30} = {merged[key]:15} ({spec['desc']})")
+    print("  (* = valore impostato, gli altri sono default)")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="HL7 Middleware CLI — gestione ordini, statistiche, audit"
@@ -204,6 +311,52 @@ def main():
     # unmatched
     p_unmatched = subparsers.add_parser("unmatched", help="Risultati orfani")
     p_unmatched.set_defaults(func=cmd_unmatched)
+
+    # operators
+    p_ops = subparsers.add_parser("operators", help="Elenco operatori")
+    p_ops.add_argument("--active-only", action="store_true", help="Solo operatori attivi")
+    p_ops.set_defaults(func=cmd_operators)
+
+    # operator-add
+    p_opadd = subparsers.add_parser("operator-add", help="Crea/aggiorna operatore")
+    p_opadd.add_argument("operator_id", help="ID operatore (badge/login)")
+    p_opadd.add_argument("full_name", help="Nome completo")
+    p_opadd.add_argument("--role", default="OPERATOR",
+                         help=f"Ruolo RBAC ({', '.join(auth.ROLES)})")
+    p_opadd.add_argument("--password", help="Password/PIN (sconsigliato: usa --ask-password)")
+    p_opadd.add_argument("--ask-password", action="store_true",
+                         help="Chiedi la password in modo interattivo")
+    p_opadd.add_argument("--poct-permission", default="OPERATOR",
+                         help=f"Permesso POCT device ({', '.join(auth.POCT_PERMISSION_LEVELS)})")
+    p_opadd.add_argument("--certification", action="append",
+                         help="Certificazione (ripetibile)")
+    p_opadd.add_argument("--valid-from", help="Validità dal (YYYY-MM-DD)")
+    p_opadd.add_argument("--valid-until", help="Validità fino (YYYY-MM-DD)")
+    p_opadd.add_argument("--inactive", action="store_true", help="Crea l'operatore inattivo")
+    p_opadd.set_defaults(func=cmd_operator_add)
+
+    # operator-passwd
+    p_oppwd = subparsers.add_parser("operator-passwd", help="Imposta password operatore")
+    p_oppwd.add_argument("operator_id", help="ID operatore")
+    p_oppwd.add_argument("--password", help="Password/PIN (altrimenti chiesta interattivamente)")
+    p_oppwd.set_defaults(func=cmd_operator_passwd)
+
+    # operator-remove
+    p_oprm = subparsers.add_parser("operator-remove", help="Elimina operatore")
+    p_oprm.add_argument("operator_id", help="ID operatore")
+    p_oprm.set_defaults(func=cmd_operator_remove)
+
+    # operator-unlock
+    p_opunlock = subparsers.add_parser("operator-unlock", help="Sblocca operatore")
+    p_opunlock.add_argument("operator_id", help="ID operatore")
+    p_opunlock.set_defaults(func=cmd_operator_unlock)
+
+    # device-config
+    p_cfg = subparsers.add_parser("device-config", help="Configurazione remota strumento")
+    p_cfg.add_argument("instrument", help="Nome strumento")
+    p_cfg.add_argument("--set", action="append", metavar="KEY=VALUE",
+                       help="Imposta un parametro (ripetibile)")
+    p_cfg.set_defaults(func=cmd_device_config)
 
     args = parser.parse_args()
 

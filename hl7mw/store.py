@@ -22,6 +22,8 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import auth
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
     sample_key TEXT PRIMARY KEY,
@@ -81,12 +83,54 @@ CREATE TABLE IF NOT EXISTS order_timing (
     sent_at TEXT,
     FOREIGN KEY(sample_key) REFERENCES orders(sample_key)
 );
+CREATE TABLE IF NOT EXISTS operators (
+    operator_id TEXT PRIMARY KEY,
+    full_name TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'OPERATOR',
+    password_hash TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    poct_permission TEXT DEFAULT 'OPERATOR',
+    certifications TEXT DEFAULT '[]',
+    valid_from TEXT,
+    valid_until TEXT,
+    locked INTEGER NOT NULL DEFAULT 0,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    last_login TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS operator_sessions (
+    token TEXT PRIMARY KEY,
+    operator_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    FOREIGN KEY(operator_id) REFERENCES operators(operator_id)
+);
+CREATE TABLE IF NOT EXISTS device_config (
+    instrument TEXT NOT NULL,
+    param_key TEXT NOT NULL,
+    param_value TEXT,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT,
+    PRIMARY KEY(instrument, param_key)
+);
+CREATE TABLE IF NOT EXISTS device_config_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instrument TEXT NOT NULL,
+    param_key TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    changed_at TEXT NOT NULL,
+    changed_by TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_results_sample ON results(sample_key);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_sample ON audit_log(sample_key);
 CREATE INDEX IF NOT EXISTS idx_instruments_status ON instruments(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_operator ON operator_sessions(operator_id);
+CREATE INDEX IF NOT EXISTS idx_config_history_instr ON device_config_history(instrument);
 """
 
 
@@ -314,3 +358,220 @@ class Store:
             "avg_time_to_ready_seconds": avg_time_to_ready,
             "avg_time_ready_to_sent_seconds": avg_time_ready_to_sent,
         }
+
+    # ----- operatori (RBAC) -----
+    @staticmethod
+    def _operator_public(row: sqlite3.Row | dict) -> dict:
+        """Vista pubblica di un operatore: niente hash password, certifications come lista."""
+        d = dict(row)
+        d.pop("password_hash", None)
+        try:
+            d["certifications"] = json.loads(d.get("certifications") or "[]")
+        except (ValueError, TypeError):
+            d["certifications"] = []
+        d["active"] = bool(d.get("active"))
+        d["locked"] = bool(d.get("locked"))
+        return d
+
+    def upsert_operator(self, operator_id: str, full_name: str, role: str = "OPERATOR",
+                        password: str | None = None, poct_permission: str = "OPERATOR",
+                        certifications: list[str] | None = None,
+                        valid_from: str | None = None, valid_until: str | None = None,
+                        active: bool = True) -> None:
+        """Crea o aggiorna un operatore. La password (se data) viene cifrata con PBKDF2.
+
+        Se `password` è None su un operatore esistente, l'hash corrente è preservato.
+        """
+        if not operator_id:
+            raise ValueError("operator_id vuoto non ammesso.")
+        if not auth.is_valid_role(role):
+            raise ValueError(f"Ruolo non valido: {role!r}")
+        pwd_hash = auth.hash_password(password) if password else None
+        certs_json = json.dumps(certifications or [], ensure_ascii=False)
+        with self._conn() as c:
+            existing = c.execute(
+                "SELECT password_hash FROM operators WHERE operator_id=?", (operator_id,)
+            ).fetchone()
+            if existing and pwd_hash is None:
+                pwd_hash = existing["password_hash"]
+            c.execute(
+                """INSERT INTO operators(operator_id, full_name, role, password_hash,
+                       active, poct_permission, certifications, valid_from, valid_until,
+                       created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(operator_id) DO UPDATE SET
+                       full_name=excluded.full_name,
+                       role=excluded.role,
+                       password_hash=excluded.password_hash,
+                       active=excluded.active,
+                       poct_permission=excluded.poct_permission,
+                       certifications=excluded.certifications,
+                       valid_from=excluded.valid_from,
+                       valid_until=excluded.valid_until,
+                       updated_at=excluded.updated_at""",
+                (operator_id, full_name, role, pwd_hash, 1 if active else 0,
+                 poct_permission, certs_json, valid_from, valid_until, _now(), _now()),
+            )
+
+    def set_operator_password(self, operator_id: str, password: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE operators SET password_hash=?, updated_at=? WHERE operator_id=?",
+                (auth.hash_password(password), _now(), operator_id),
+            )
+            return cur.rowcount > 0
+
+    def set_operator_active(self, operator_id: str, active: bool) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE operators SET active=?, updated_at=? WHERE operator_id=?",
+                (1 if active else 0, _now(), operator_id),
+            )
+            return cur.rowcount > 0
+
+    def set_operator_locked(self, operator_id: str, locked: bool) -> bool:
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE operators SET locked=?, failed_attempts=?, updated_at=? WHERE operator_id=?",
+                (1 if locked else 0, 0 if not locked else None, _now(), operator_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_operator(self, operator_id: str) -> bool:
+        with self._conn() as c:
+            c.execute("DELETE FROM operator_sessions WHERE operator_id=?", (operator_id,))
+            cur = c.execute("DELETE FROM operators WHERE operator_id=?", (operator_id,))
+            return cur.rowcount > 0
+
+    def get_operator(self, operator_id: str) -> dict | None:
+        """Vista pubblica dell'operatore (senza hash password)."""
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM operators WHERE operator_id=?", (operator_id,)).fetchone()
+            return self._operator_public(row) if row else None
+
+    def list_operators(self, active_only: bool = False) -> list[dict]:
+        with self._conn() as c:
+            q = "SELECT * FROM operators"
+            if active_only:
+                q += " WHERE active=1"
+            q += " ORDER BY operator_id"
+            return [self._operator_public(r) for r in c.execute(q)]
+
+    def authenticate_operator(self, operator_id: str, password: str) -> dict | None:
+        """Verifica credenziali. Ritorna la vista pubblica se OK, altrimenti None.
+
+        Gestisce lockout dopo 5 tentativi falliti e aggiorna last_login al successo.
+        Operatori inattivi/bloccati non possono autenticarsi.
+        """
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM operators WHERE operator_id=?", (operator_id,)).fetchone()
+            if not row:
+                return None
+            if not row["active"] or row["locked"]:
+                return None
+            if auth.verify_password(password, row["password_hash"]):
+                c.execute(
+                    "UPDATE operators SET failed_attempts=0, last_login=?, updated_at=? WHERE operator_id=?",
+                    (_now(), _now(), operator_id),
+                )
+                return self._operator_public(row)
+            # Password errata: incrementa i tentativi ed eventualmente blocca.
+            attempts = (row["failed_attempts"] or 0) + 1
+            locked = 1 if attempts >= 5 else 0
+            c.execute(
+                "UPDATE operators SET failed_attempts=?, locked=?, updated_at=? WHERE operator_id=?",
+                (attempts, locked, _now(), operator_id),
+            )
+            return None
+
+    # ----- sessioni / token -----
+    def create_session(self, operator_id: str, ttl_seconds: int = 8 * 3600) -> str:
+        token = auth.generate_token()
+        expires = (_dt.datetime.now() + _dt.timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO operator_sessions(token, operator_id, created_at, expires_at) VALUES(?,?,?,?)",
+                (token, operator_id, _now(), expires),
+            )
+        return token
+
+    def get_session_operator(self, token: str) -> dict | None:
+        """Operatore associato a un token valido e non scaduto, altrimenti None."""
+        if not token:
+            return None
+        with self._conn() as c:
+            sess = c.execute("SELECT * FROM operator_sessions WHERE token=?", (token,)).fetchone()
+            if not sess:
+                return None
+            try:
+                if _dt.datetime.fromisoformat(sess["expires_at"]) < _dt.datetime.now():
+                    c.execute("DELETE FROM operator_sessions WHERE token=?", (token,))
+                    return None
+            except (ValueError, TypeError):
+                return None
+            row = c.execute(
+                "SELECT * FROM operators WHERE operator_id=?", (sess["operator_id"],)
+            ).fetchone()
+            if not row or not row["active"] or row["locked"]:
+                return None
+            return self._operator_public(row)
+
+    def delete_session(self, token: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM operator_sessions WHERE token=?", (token,))
+
+    def purge_expired_sessions(self) -> int:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM operator_sessions WHERE expires_at < ?", (_now(),))
+            return cur.rowcount
+
+    def count_operators(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) n FROM operators").fetchone()["n"]
+
+    # ----- configurazione remota strumenti -----
+    def set_device_config(self, instrument: str, params: dict[str, str],
+                          updated_by: str | None = None) -> None:
+        """Applica una mappa di parametri di configurazione a uno strumento.
+
+        Registra ogni variazione in device_config_history (tracciabilità).
+        """
+        with self._conn() as c:
+            for key, value in params.items():
+                value_s = "" if value is None else str(value)
+                old = c.execute(
+                    "SELECT param_value FROM device_config WHERE instrument=? AND param_key=?",
+                    (instrument, key),
+                ).fetchone()
+                old_value = old["param_value"] if old else None
+                if old_value == value_s:
+                    continue
+                c.execute(
+                    """INSERT INTO device_config(instrument, param_key, param_value, updated_at, updated_by)
+                       VALUES(?,?,?,?,?)
+                       ON CONFLICT(instrument, param_key) DO UPDATE SET
+                           param_value=excluded.param_value,
+                           updated_at=excluded.updated_at,
+                           updated_by=excluded.updated_by""",
+                    (instrument, key, value_s, _now(), updated_by),
+                )
+                c.execute(
+                    """INSERT INTO device_config_history(instrument, param_key, old_value, new_value, changed_at, changed_by)
+                       VALUES(?,?,?,?,?,?)""",
+                    (instrument, key, old_value, value_s, _now(), updated_by),
+                )
+
+    def get_device_config(self, instrument: str) -> dict[str, str]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT param_key, param_value FROM device_config WHERE instrument=? ORDER BY param_key",
+                (instrument,),
+            ).fetchall()
+            return {r["param_key"]: r["param_value"] for r in rows}
+
+    def get_device_config_history(self, instrument: str, limit: int = 200) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM device_config_history WHERE instrument=? ORDER BY changed_at DESC LIMIT ?",
+                (instrument, limit),
+            )]

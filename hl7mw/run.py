@@ -60,6 +60,11 @@ DEFAULTS = {
     "hemoscreen_poct1a2_port": 6664,
     "hemoscreen_poct1a2_continuous_mode": False,
     "hemoscreen_poct1a2_timeout": 65.0,
+    "hemoscreen_poct1a2_instrument_name": "HEMOSCREEN-POCT",
+    "hemoscreen_poct1a2_push_config_on_connect": False,
+    # Bootstrap operatore amministratore (creato al primo avvio se non esistono operatori)
+    "bootstrap_admin_id": "admin",
+    "bootstrap_admin_password": "",
 }
 
 
@@ -86,6 +91,18 @@ def main(argv=None) -> int:
 
     store = Store(cfg["db_path"])
     monitor = DeviceMonitor(store, cfg.get("device_offline_timeout_seconds", 300.0))
+
+    # Bootstrap dell'operatore amministratore al primo avvio (nessun operatore in DB).
+    if store.count_operators() == 0:
+        admin_pwd = cfg.get("bootstrap_admin_password") or ""
+        admin_id = cfg.get("bootstrap_admin_id") or "admin"
+        store.upsert_operator(admin_id, "Amministratore", role="ADMIN",
+                              password=admin_pwd or None)
+        if admin_pwd:
+            LOG.info("Operatore amministratore '%s' creato (bootstrap).", admin_id)
+        else:
+            LOG.warning("Operatore amministratore '%s' creato SENZA password: "
+                        "impostarne una con la CLI (operator-passwd) prima dell'uso.", admin_id)
 
     order_rx = OrderReceiver(store, cfg["order_listen_host"], cfg["order_listen_port"],
                              cfg["sending_app"], cfg["sending_facility"], monitor).start()
@@ -141,6 +158,8 @@ def main(argv=None) -> int:
             cfg["hemoscreen_poct1a2_port"],
             continuous_mode=cfg["hemoscreen_poct1a2_continuous_mode"],
             timeout=cfg["hemoscreen_poct1a2_timeout"],
+            instrument_name=cfg.get("hemoscreen_poct1a2_instrument_name", "HEMOSCREEN-POCT"),
+            push_config_on_connect=cfg.get("hemoscreen_poct1a2_push_config_on_connect", False),
         ).start()
 
     signal.signal(signal.SIGINT, _sig)
