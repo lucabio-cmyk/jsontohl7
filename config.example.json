@@ -17,6 +17,12 @@
   "status_host": "127.0.0.1",
   "status_port": 8080,
 
+  "api_enabled": true,
+  "api_host": "0.0.0.0",
+  "api_port": 8000,
+
+  "device_offline_timeout_seconds": 300.0,
+
   "sending_app": "HL7MW",
   "sending_facility": "MIDDLEWARE",
   "receiving_app": "LIS",

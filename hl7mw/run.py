@@ -22,9 +22,17 @@ from pathlib import Path
 from . import hl7
 from .store import Store
 from .pipeline import OrderReceiver, ResultReceiver, Forwarder
+from .monitor import DeviceMonitor
 from .webstatus import StatusServer
 from .adapters.hemoscreen_hl7 import HemoscreenHl7ResultReceiver
 from .adapters.hemoscreen_poct1a2 import HemoscreenPoct1A2Receiver
+
+try:
+    from .api import init_api
+    import uvicorn
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
 
 LOG = logging.getLogger("hl7mw")
 _STOP = False
@@ -38,8 +46,10 @@ DEFAULTS = {
     "ack_retry_attempts": 2,
     "ack_retry_backoff_seconds": 0.5,
     "status_host": "127.0.0.1", "status_port": 8080, "status_enabled": True,
+    "api_enabled": True, "api_host": "0.0.0.0", "api_port": 8000,
     "sending_app": "HL7MW", "sending_facility": "MIDDLEWARE",
     "receiving_app": "LIS", "receiving_facility": "OSP",
+    "device_offline_timeout_seconds": 300.0,
     # Adapter HemoScreen HL7 v2.4
     "hemoscreen_hl7_enabled": False,
     "hemoscreen_hl7_host": "0.0.0.0",
@@ -75,10 +85,12 @@ def main(argv=None) -> int:
     cfg = load_config(args.config)
 
     store = Store(cfg["db_path"])
+    monitor = DeviceMonitor(store, cfg.get("device_offline_timeout_seconds", 300.0))
+
     order_rx = OrderReceiver(store, cfg["order_listen_host"], cfg["order_listen_port"],
-                             cfg["sending_app"], cfg["sending_facility"]).start()
+                             cfg["sending_app"], cfg["sending_facility"], monitor).start()
     result_rx = ResultReceiver(store, cfg["result_listen_host"], cfg["result_listen_port"],
-                               cfg["sending_app"], cfg["sending_facility"]).start()
+                               cfg["sending_app"], cfg["sending_facility"], monitor).start()
     oru_cfg = hl7.OruConfig(cfg["sending_app"], cfg["sending_facility"],
                             cfg["receiving_app"], cfg["receiving_facility"])
     forwarder = Forwarder(store, cfg["lis_host"], cfg["lis_port"], oru_cfg,
@@ -89,6 +101,27 @@ def main(argv=None) -> int:
     if cfg.get("status_enabled"):
         status = StatusServer(store, cfg["status_host"], cfg["status_port"]).start()
         LOG.info("Status UI su http://%s:%s", cfg["status_host"], cfg["status_port"])
+
+    api_thread = None
+    if cfg.get("api_enabled") and FASTAPI_AVAILABLE:
+        import threading
+        app = init_api(store)
+
+        def run_api():
+            uvicorn.run(
+                app,
+                host=cfg.get("api_host", "0.0.0.0"),
+                port=cfg.get("api_port", 8000),
+                log_level="info",
+                access_log=False,
+                install_signal_handlers=False,
+            )
+
+        api_thread = threading.Thread(target=run_api, daemon=True)
+        api_thread.start()
+        LOG.info("FastAPI Dashboard su http://%s:%s", cfg.get("api_host", "0.0.0.0"), cfg.get("api_port", 8000))
+    elif cfg.get("api_enabled") and not FASTAPI_AVAILABLE:
+        LOG.warning("API abilitato ma FastAPI non installato (pip install fastapi uvicorn)")
 
     hs_hl7 = None
     if cfg.get("hemoscreen_hl7_enabled"):
