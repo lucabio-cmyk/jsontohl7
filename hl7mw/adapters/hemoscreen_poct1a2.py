@@ -439,12 +439,10 @@ class _Conversation:
 
                 # ---- EVS.R01 (eventi strumento) -----------------------------
                 elif msg_type == "EVS.R01":
-                    for evt in root.findall("EVT"):
                     for evt in root.findall(".//EVT"):
                         sev  = _attr(evt.find("EVT.severity_cd"))
                         num  = _attr(evt.find("EVT.number"))
-                        LOG.info("POCT1-A2 evento %s [%s] #%s: %s",
-                                 self._addr, sev, num, desc)
+                        LOG.info("POCT1-A2 evento %s [%s] #%s", self._addr, sev, num)
                     self._send(_xml_ack(self._next_ctrl(), ctrl_id))
 
                 # ---- Messaggi non riconosciuti -------------------------------
