@@ -156,6 +156,52 @@ def test_instrument_health_check():
         assert instr["status"] == "ONLINE"
 
 
+def test_match_unmatched_atomic():
+    """Verifica il matching atomico dei risultati orfani."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Store(Path(tmpdir) / "test.db")
+
+        # Crea ordine
+        order = {
+            "sample_key": "ABC123",
+            "placer_order_number": "P001",
+            "filler_order_number": "F001",
+            "specimen_id": "SP001",
+            "universal_service_id": {"text": "CBC"},
+        }
+        db.upsert_order(order)
+
+        # Aggiungi risultato orfano con source_instrument
+        from hl7mw.store import _now
+        orphan_result = {
+            "sample_key": "ABC123",
+            "results": [{"test": "value"}]
+        }
+        with db._conn() as c:
+            cursor = c.execute(
+                "INSERT INTO unmatched_results(sample_key, result_json, received_at, source_instrument) VALUES(?,?,?,?)",
+                ("ABC123", json.dumps(orphan_result, ensure_ascii=False), _now(), "HEMO1"),
+            )
+            result_id = cursor.lastrowid
+
+        # Verifica che sia orfano
+        unmatched_before = db.unmatched()
+        assert len(unmatched_before) == 1
+
+        # Effettua matching atomico
+        success = db.match_unmatched(result_id, "ABC123")
+        assert success is True
+
+        # Verifica che non sia più orfano
+        unmatched_after = db.unmatched()
+        assert len(unmatched_after) == 0
+
+        # Verifica che sia nei risultati matched con source_instrument preservato
+        results = db.results_for("ABC123")
+        assert len(results) == 1
+        assert results[0]["results"][0]["test"] == "value"
+
+
 if __name__ == "__main__":
     test_extended_schema()
     test_instrument_tracking()
@@ -163,4 +209,5 @@ if __name__ == "__main__":
     test_order_timing()
     test_dashboard_stats()
     test_instrument_health_check()
+    test_match_unmatched_atomic()
     print("TUTTI I TEST OK")

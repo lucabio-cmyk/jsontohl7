@@ -168,20 +168,9 @@ async def match_unmatched(result_id: int, sample_key: str):
     if not _store:
         raise HTTPException(status_code=500, detail="Store not initialized")
 
-    order = _store.get_order(sample_key)
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    with _store._conn() as c:
-        row = c.execute(
-            "SELECT result_json FROM unmatched_results WHERE id=?", (result_id,)
-        ).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Unmatched result not found")
-
-        result = json.loads(row["result_json"])
-        _store.add_result(sample_key, result)
-        c.execute("DELETE FROM unmatched_results WHERE id=?", (result_id,))
+    success = _store.match_unmatched(result_id, sample_key)
+    if not success:
+        raise HTTPException(status_code=404, detail="Unmatched result not found or order doesn't exist")
 
     _store.audit_log(
         "unmatched_matched",
