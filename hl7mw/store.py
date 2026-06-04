@@ -176,6 +176,21 @@ class Store:
             return [dict(r) for r in c.execute(
                 "SELECT * FROM unmatched_results ORDER BY received_at")]
 
+    def match_unmatched(self, result_id: int, sample_key: str) -> bool:
+        """Associa atomicamente un risultato orfano a un ordine preservando lo strumento sorgente."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT result_json, source_instrument FROM unmatched_results WHERE id=?", (result_id,)
+            ).fetchone()
+            if not row:
+                return False
+            c.execute(
+                "INSERT INTO results(sample_key, result_json, received_at, source_instrument) VALUES(?,?,?,?)",
+                (sample_key, row["result_json"], _now(), row["source_instrument"]),
+            )
+            c.execute("DELETE FROM unmatched_results WHERE id=?", (result_id,))
+            return True
+
     # ----- instruments -----
     def upsert_instrument(self, name: str, host: str, port: int, type_: str = "POCT") -> None:
         with self._conn() as c:
