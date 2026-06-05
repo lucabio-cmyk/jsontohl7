@@ -7,4 +7,4 @@
 3. **Come integration engineer** voglio retry automatico su ACK mancante.
    - AC: backoff, max tentativi, escalation.
 4. **Come quality manager** voglio bloccare rilascio se QC fallito/scaduto.
-   - AC: stato `quarantined`, notifica POCT coordinator.
+   - AC: stato `quarantined`, notifica POCT coordinator. ✅ (blocco QC a livello pipeline con stato `QUARANTINED`)
