@@ -55,12 +55,15 @@ warning nei log, e restano attivi ordini/risultati/inoltro + Stato UI minimale.
 
 La dashboard (`http://host:8000/`) ha un pulsante **⚙ Impostazioni** che apre un
 form per l'intera configurazione — LIS, strumenti (HemoScreen), VPN, rete/servizio
-— con validazione (chiavi/tipi) e un pulsante **Verifica tunnel** che testa la
-raggiungibilità VPN in tempo reale (`GET /api/vpn/check`), senza dover salvare
-prima. Il salvataggio scrive su `config.json` (`GET`/`PUT /api/config`): **non è
-applicato a runtime** — LIS, VPN e adapter strumenti sono inizializzati una sola
-volta all'avvio, quindi serve riavviare il servizio perché le modifiche abbiano
-effetto (la dashboard lo segnala esplicitamente dopo il salvataggio).
+— con validazione (chiavi/tipi), un pulsante **Verifica tunnel** che testa la
+raggiungibilità VPN in tempo reale (`GET /api/vpn/check`) senza dover salvare
+prima, e — se `vpn_manage_lifecycle: true` — **Avvia tunnel**/**Ferma tunnel**
+per avviarlo/fermarlo on-demand (`POST /api/vpn/up`/`/down`, agiscono sulla
+configurazione già salvata, non sul form). Il salvataggio scrive su
+`config.json` (`GET`/`PUT /api/config`): **non è applicato a runtime** — LIS,
+VPN e adapter strumenti sono inizializzati una sola volta all'avvio, quindi
+serve riavviare il servizio perché le modifiche abbiano effetto (la dashboard
+lo segnala esplicitamente dopo il salvataggio).
 
 ## Eseguibile Windows (.exe)
 
@@ -134,7 +137,7 @@ python3 tests/test_management_system.py # API/store v2: dashboard, retry, audit,
 python3 tests/test_ack_retry_backoff.py # retry/backoff su ACK del LIS
 python3 tests/test_hemoscreen.py        # adapter strumento HemoScreen (HL7 e POCT1-A2)
 python3 tests/test_citizencare.py       # sostituzione CCHS: ADT^A04 + ORM^O01 -> ORU^R01 verso il vero LIS + modulo VPN
-python3 tests/test_config_api.py        # pagina Impostazioni: GET/PUT /api/config, GET /api/vpn/check
+python3 tests/test_config_api.py        # pagina Impostazioni: GET/PUT /api/config, avvio/arresto/verifica VPN
 ```
 
 ## Stato attuale e prossimi passi

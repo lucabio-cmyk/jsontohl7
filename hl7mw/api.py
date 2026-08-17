@@ -125,6 +125,51 @@ async def check_vpn(host: str = Query(...), port: int = Query(..., ge=1, le=6553
     return {"host": host, "port": port, "reachable": mgr.is_reachable()}
 
 
+def _vpn_manager_from_saved_config() -> vpnmod.VpnManager:
+    """Costruisce il VpnManager dalla configurazione SALVATA su disco (non da
+    eventuali modifiche non ancora salvate nel form): avviare/fermare un
+    tunnel reale in base a valori non salvati sarebbe fonte di errori."""
+    cfg = _read_config()
+    mgr = vpnmod.from_config(cfg)
+    if not mgr:
+        raise HTTPException(status_code=400, detail="vpn_enabled e' false nella configurazione salvata")
+    if not mgr.manage_lifecycle:
+        raise HTTPException(
+            status_code=400,
+            detail="vpn_manage_lifecycle e' false: il tunnel e' gestito esternamente (systemd/appliance), "
+                   "il middleware non lo avvia/ferma",
+        )
+    return mgr
+
+
+@app.post("/api/vpn/up")
+async def start_vpn():
+    """Avvia il tunnel (solo se vpn_enabled + vpn_manage_lifecycle nella
+    configurazione salvata): wg-quick/openvpn/comando custom, vedi hl7mw/vpn.py."""
+    mgr = _vpn_manager_from_saved_config()
+    try:
+        mgr.up()
+    except vpnmod.VpnError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if _store:
+        _store.audit_log("vpn_up_triggered", details=f"provider={mgr.provider}", severity="INFO")
+    return {"status": "ok"}
+
+
+@app.post("/api/vpn/down")
+async def stop_vpn():
+    """Ferma il tunnel (solo se vpn_enabled + vpn_manage_lifecycle nella
+    configurazione salvata)."""
+    mgr = _vpn_manager_from_saved_config()
+    try:
+        mgr.down()
+    except vpnmod.VpnError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if _store:
+        _store.audit_log("vpn_down_triggered", details=f"provider={mgr.provider}", severity="INFO")
+    return {"status": "ok"}
+
+
 @app.get("/api/dashboard")
 async def get_dashboard():
     """Statistiche globali: conteggi, timing medio, instrument status."""
@@ -882,6 +927,17 @@ def get_dashboard_html() -> str:
                     html += `<div class="settings-actions" style="border-top:none;padding-top:8px;margin-top:8px;">
                         <button type="button" class="action-button" onclick="checkVpn()">Verifica tunnel</button>
                         <span id="vpnCheckResult"></span>
+                    </div>
+                    <div class="settings-actions" style="border-top:none;padding-top:0;margin-top:4px;">
+                        <button type="button" class="action-button" onclick="controlVpn('up')">Avvia tunnel</button>
+                        <button type="button" class="action-button danger" onclick="controlVpn('down')">Ferma tunnel</button>
+                        <span id="vpnControlResult"></span>
+                    </div>
+                    <div class="settings-note" style="margin-top:8px;">
+                        "Avvia/Ferma tunnel" agiscono sulla configurazione già <strong>salvata</strong> su
+                        disco (non su modifiche non ancora salvate in questo form) e solo se
+                        "Il middleware gestisce avvio/arresto tunnel" è attivo — altrimenti il tunnel è
+                        gestito esternamente (systemd/appliance) e questi pulsanti restituiscono un errore.
                     </div>`;
                 }
             }
@@ -955,6 +1011,28 @@ def get_dashboard_html() -> str:
                 resultEl.style.color = data.reachable ? '#27ae60' : '#e74c3c';
             } catch (e) {
                 resultEl.textContent = 'Errore nella verifica.';
+                resultEl.style.color = '#e74c3c';
+            }
+        }
+
+        async function controlVpn(action) {
+            const label = action === 'up' ? 'avviare' : 'fermare';
+            if (!confirm(`Confermi di voler ${label} il tunnel VPN (configurazione salvata)?`)) return;
+            const resultEl = document.getElementById('vpnControlResult');
+            resultEl.textContent = action === 'up' ? 'Avvio in corso…' : 'Arresto in corso…';
+            resultEl.style.color = '#666';
+            try {
+                const resp = await fetch(`/api/vpn/${action}`, { method: 'POST' });
+                const data = await resp.json().catch(() => ({}));
+                if (resp.ok) {
+                    resultEl.textContent = action === 'up' ? '✓ tunnel avviato' : '✓ tunnel fermato';
+                    resultEl.style.color = '#27ae60';
+                } else {
+                    resultEl.textContent = '✗ ' + (data.detail || `errore ${resp.status}`);
+                    resultEl.style.color = '#e74c3c';
+                }
+            } catch (e) {
+                resultEl.textContent = '✗ errore di rete';
                 resultEl.style.color = '#e74c3c';
             }
         }

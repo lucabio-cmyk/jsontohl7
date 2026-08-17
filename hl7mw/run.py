@@ -201,7 +201,10 @@ def main(argv=None) -> int:
         if hs_poct:
             hs_poct.stop()
         if vpn_manager:
-            vpn_manager.down()
+            try:
+                vpn_manager.down()
+            except vpnmod.VpnError as e:
+                LOG.warning("VPN: arresto tunnel non riuscito: %s", e)
         LOG.info("Middleware arrestato.")
     return 0
 

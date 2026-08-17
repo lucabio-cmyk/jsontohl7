@@ -51,6 +51,9 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
   (componenti inizializzati all'avvio, serve riavvio) — validazione chiavi/tipi contro
   `run.DEFAULTS` in `api._validate_config_update`
 - Endpoint `/api/vpn/check` — health-check on-demand host:porta (bottone "Verifica tunnel")
+- Endpoint `/api/vpn/up` / `/api/vpn/down` (POST) — avvia/ferma il tunnel on-demand (wg-quick/openvpn/
+  comando custom, vedi `hl7mw/vpn.py`), solo se `vpn_enabled`+`vpn_manage_lifecycle` nella
+  configurazione **salvata** (non nel form non ancora salvato); 400 esplicito altrimenti
 - **Dashboard HTML moderna**: Chart.js (doughnut chart status, metriche KPI, tabelle ordini, azioni, device status)
 
 Abilitazione: `"api_enabled": true` in config, oppure `pip install fastapi uvicorn`

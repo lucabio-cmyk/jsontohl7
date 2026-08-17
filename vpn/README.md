@@ -78,9 +78,12 @@ Bidirezionale, ristretto agli IP/porte concordati, attraverso il tunnel:
 In `config.json` (vedi `config.example.json`): `lis_host`/`lis_port` sono gli
 endpoint del **vero LIS**, non di CCHS. In alternativa a modificare il file a
 mano, la dashboard (`http://host:8000/`) ha una pagina **⚙ Impostazioni** con
-questi stessi campi e un pulsante **Verifica tunnel** che testa la
-raggiungibilità in tempo reale prima ancora di salvare — il salvataggio scrive
-comunque su `config.json` e richiede un riavvio del servizio per avere effetto.
+questi stessi campi, un pulsante **Verifica tunnel** che testa la
+raggiungibilità in tempo reale prima ancora di salvare, e — se
+`vpn_manage_lifecycle: true` (cioè è il middleware stesso a gestire il tunnel,
+non systemd) — **Avvia tunnel**/**Ferma tunnel** per farlo on-demand senza
+riavviare il servizio. Il salvataggio delle impostazioni scrive comunque su
+`config.json` e richiede un riavvio perché le modifiche abbiano effetto.
 
 ```jsonc
 "lis_host": "10.9.0.10",   // IP del LIS lato tunnel

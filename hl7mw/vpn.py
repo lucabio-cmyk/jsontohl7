@@ -102,8 +102,11 @@ class VpnManager:
             raise VpnError(f"Impossibile eseguire il comando VPN: {e}") from e
 
     def down(self) -> None:
-        """Arresta il tunnel (solo se manage_lifecycle=True). Non solleva: un errore
-        in arresto non deve impedire lo shutdown pulito del middleware."""
+        """Arresta il tunnel (solo se manage_lifecycle=True). Solleva VpnError in
+        caso di fallimento (simmetrico a up()): sta al chiamante decidere se
+        tollerarlo (es. shutdown, dove non deve bloccare l'arresto pulito) o
+        segnalarlo (es. azione on-demand dalla GUI, dove l'operatore deve
+        sapere se il comando e' davvero fallito)."""
         if not self.manage_lifecycle:
             return
         cmd = shlex.split(self.down_command) if self.down_command else self._default_down_command()
@@ -112,8 +115,10 @@ class VpnManager:
         LOG.info("VPN: arresto tunnel (%s)...", " ".join(cmd))
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30)
-        except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as e:
-            LOG.warning("VPN: arresto tunnel non riuscito: %s", e)
+        except subprocess.CalledProcessError as e:
+            raise VpnError(f"Comando VPN fallito ({e.returncode}): {e.stderr or e.stdout}") from e
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise VpnError(f"Impossibile eseguire il comando VPN: {e}") from e
 
     # ------------------------------------------------------------- health check
     def is_reachable(self) -> bool:

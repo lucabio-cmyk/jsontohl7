@@ -73,6 +73,15 @@ def _put(url: str, body: dict) -> tuple[int, dict]:
         return e.code, json.loads(e.read())
 
 
+def _post(url: str) -> tuple[int, dict]:
+    req = urllib.request.Request(url, data=b"", method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
 def test_config_roundtrip_and_validation():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = Store(str(Path(tmpdir) / "test.db"))
@@ -150,10 +159,66 @@ def test_vpn_check_endpoint():
             _stop_server(server, thread)
 
 
+def test_vpn_up_down_endpoints():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = Store(str(Path(tmpdir) / "test.db"))
+        config_path = str(Path(tmpdir) / "config.json")
+        app = hl7mw_api.init_api(store, config_path, DEFAULTS)
+
+        port = _free_port()
+        server, thread = _start_server(app, "127.0.0.1", port)
+        base = f"http://127.0.0.1:{port}"
+        try:
+            # 1) vpn_enabled=false (default): entrambi rifiutati con 400
+            status, data = _post(f"{base}/api/vpn/up")
+            assert status == 400 and "vpn_enabled" in data["detail"]
+            print("[9] POST /api/vpn/up con VPN disabilitata -> 400  OK")
+
+            # 2) vpn_enabled=true ma manage_lifecycle=false (default): 400 esplicito
+            _put(f"{base}/api/config", {"vpn_enabled": True})
+            status, data = _post(f"{base}/api/vpn/up")
+            assert status == 400 and "vpn_manage_lifecycle" in data["detail"]
+            print("[10] POST /api/vpn/up con manage_lifecycle=false -> 400  OK")
+
+            # 3) manage_lifecycle=true, provider=external: nessun comando da eseguire -> successo (no-op)
+            _put(f"{base}/api/config", {"vpn_manage_lifecycle": True, "vpn_provider": "external"})
+            status, data = _post(f"{base}/api/vpn/up")
+            assert status == 200 and data["status"] == "ok"
+            status, data = _post(f"{base}/api/vpn/down")
+            assert status == 200 and data["status"] == "ok"
+            print("[11] POST /api/vpn/up e /api/vpn/down con provider=external -> 200 (no-op)  OK")
+
+            audit = store.get_audit_log(limit=10)
+            assert any(a["event_type"] == "vpn_up_triggered" for a in audit)
+            assert any(a["event_type"] == "vpn_down_triggered" for a in audit)
+            print("[12] audit_log traccia vpn_up_triggered/vpn_down_triggered  OK")
+        finally:
+            _stop_server(server, thread)
+
+
+def test_vpn_down_raises_on_failure():
+    """VpnManager.down() ora e' simmetrico a up(): solleva VpnError se il
+    comando fallisce, non lo inghiotte piu' silenziosamente (prima di questo
+    fix un chiamante on-demand come /api/vpn/down non poteva mai sapere se
+    l'arresto del tunnel fosse davvero riuscito)."""
+    from hl7mw import vpn as vpnmod
+
+    mgr = vpnmod.VpnManager(provider="external", manage_lifecycle=True,
+                            down_command="/bin/eseguibile-che-non-esiste-xyz")
+    try:
+        mgr.down()
+        assert False, "down() doveva sollevare VpnError"
+    except vpnmod.VpnError:
+        pass
+    print("[13] VpnManager.down(): solleva VpnError se il comando fallisce  OK")
+
+
 if __name__ == "__main__":
     if not FASTAPI_AVAILABLE:
         print("fastapi/uvicorn non installati: test saltato (pip install -e \".[api]\").")
         sys.exit(0)
     test_config_roundtrip_and_validation()
     test_vpn_check_endpoint()
+    test_vpn_up_down_endpoints()
+    test_vpn_down_raises_on_failure()
     print("\nTUTTI I TEST CONFIG API OK")
