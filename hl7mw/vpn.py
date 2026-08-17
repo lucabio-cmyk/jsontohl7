@@ -17,10 +17,13 @@ dipendenze esterne nel core" (vedi CLAUDE.md).
 from __future__ import annotations
 
 import logging
+import os
 import shlex
+import signal
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 LOG = logging.getLogger("hl7mw")
 
@@ -62,6 +65,12 @@ class VpnManager:
         self.poll_interval = poll_interval
 
     # ------------------------------------------------------------- comandi
+    def _openvpn_pid_file(self) -> str:
+        """Pidfile del processo openvpn --daemon avviato da vpn_config_path
+        (nessuna unit systemd da poter fermare: serve tracciare il PID reale,
+        scritto dal processo stesso via --writepid, per poterlo fermare in down())."""
+        return f"{self.config_path}.pid"
+
     def _default_up_command(self) -> list[str] | None:
         if self.provider == "wireguard":
             target = self.interface or self.config_path
@@ -72,7 +81,8 @@ class VpnManager:
             if self.interface:
                 return ["systemctl", "start", f"openvpn-client@{self.interface}"]
             if self.config_path:
-                return ["openvpn", "--config", self.config_path, "--daemon"]
+                return ["openvpn", "--config", self.config_path, "--daemon",
+                        "--writepid", self._openvpn_pid_file()]
             raise VpnError("vpn_interface o vpn_config_path richiesti per provider=openvpn")
         return None
 
@@ -83,6 +93,24 @@ class VpnManager:
         if self.provider == "openvpn" and self.interface:
             return ["systemctl", "stop", f"openvpn-client@{self.interface}"]
         return None
+
+    def _stop_openvpn_daemon(self) -> None:
+        """Ferma il processo openvpn --daemon avviato da vpn_config_path (senza
+        interface/unit systemd, _default_down_command() non ha nulla da
+        restituire): legge il PID scritto da --writepid e lo termina."""
+        pid_file = Path(self._openvpn_pid_file())
+        if not pid_file.exists():
+            raise VpnError(
+                f"Impossibile fermare openvpn: pidfile {pid_file} non trovato "
+                f"(processo gia' terminato, o mai avviato da questo middleware?)"
+            )
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ValueError) as e:
+            raise VpnError(f"Impossibile fermare openvpn (pid file {pid_file}): {e}") from e
+        finally:
+            pid_file.unlink(missing_ok=True)
 
     def up(self) -> None:
         """Avvia il tunnel (solo se manage_lifecycle=True); altrimenti no-op."""
@@ -111,6 +139,13 @@ class VpnManager:
             return
         cmd = shlex.split(self.down_command) if self.down_command else self._default_down_command()
         if not cmd:
+            if not self.down_command and self.provider == "openvpn" and not self.interface and self.config_path:
+                # Avviato con "openvpn --config ... --daemon" (nessuna interface/unit
+                # systemd da fermare): l'unico modo per fermarlo e' il PID scritto
+                # da --writepid in up(), altrimenti il processo sopravvive al
+                # riavvio del middleware.
+                LOG.info("VPN: arresto tunnel (openvpn --daemon, da pidfile)...")
+                self._stop_openvpn_daemon()
             return
         LOG.info("VPN: arresto tunnel (%s)...", " ".join(cmd))
         try:

@@ -100,6 +100,18 @@ def _sig(_s, _f):
     _STOP = True
 
 
+def resolve_vpn_health_check(cfg: dict) -> None:
+    """Applica (in-place) il fallback host/porta dell'health-check VPN sul LIS
+    (lis_host/lis_port) quando non specificati esplicitamente in config —
+    indipendentemente l'uno dall'altro, cosi' un operatore che ne configura
+    solo uno (es. un health-check su un endpoint diverso da lis_host ma sulla
+    stessa porta) non si vede scavalcare anche l'altro."""
+    if not cfg.get("vpn_health_check_host"):
+        cfg["vpn_health_check_host"] = cfg.get("lis_host")
+    if not cfg.get("vpn_health_check_port"):
+        cfg["vpn_health_check_port"] = cfg.get("lis_port")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Middleware HL7v2 order-driven.")
     ap.add_argument("-c", "--config")
@@ -115,12 +127,7 @@ def main(argv=None) -> int:
 
     vpn_manager = None
     if cfg.get("vpn_enabled"):
-        # Se non specificato esplicitamente, l'health-check punta al LIS
-        # (lis_host/lis_port): e' l'endpoint che deve essere raggiungibile
-        # attraverso il tunnel per poter inoltrare gli ORU.
-        if not cfg.get("vpn_health_check_host"):
-            cfg["vpn_health_check_host"] = cfg.get("lis_host")
-            cfg["vpn_health_check_port"] = cfg.get("lis_port")
+        resolve_vpn_health_check(cfg)
         vpn_manager = vpnmod.from_config(cfg)
         vpn_manager.ensure_up()  # non bloccante: logga ed eventualmente ritenta nel loop
 
@@ -184,6 +191,7 @@ def main(argv=None) -> int:
             cfg["hemoscreen_hl7_port"],
             cfg["sending_app"],
             cfg["sending_facility"],
+            monitor,
         ).start()
 
     hs_poct = None

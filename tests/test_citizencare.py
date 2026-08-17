@@ -21,6 +21,7 @@ Simula:
 Eseguibile senza pytest: `python3 tests/test_citizencare.py`
 """
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -29,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hl7mw import hl7, mllp, vpn
+from hl7mw.run import resolve_vpn_health_check
 from hl7mw.store import Store
 from hl7mw.pipeline import OrderReceiver, ResultReceiver, Forwarder
 
@@ -242,6 +244,69 @@ def test_vpn_from_config_disabled():
     print("[8] vpn.from_config: rispetta vpn_enabled e legge i parametri  OK")
 
 
+def test_resolve_vpn_health_check_independent_fallback():
+    """host e porta dell'health-check VPN devono avere un fallback su lis_host/lis_port
+    indipendente l'uno dall'altro: un override di uno solo dei due non deve
+    scavalcare l'altro (bug corretto: prima bastava impostare solo l'host per
+    lasciare la porta a 0 -> health-check silenziosamente disabilitato, e
+    impostare solo la porta veniva sovrascritto dal fallback dell'host)."""
+    # nessuno dei due impostato -> entrambi ereditano da lis_host/lis_port
+    cfg = {"lis_host": "10.9.0.10", "lis_port": 2576}
+    resolve_vpn_health_check(cfg)
+    assert cfg["vpn_health_check_host"] == "10.9.0.10"
+    assert cfg["vpn_health_check_port"] == 2576
+
+    # solo l'host impostato -> la porta deve comunque ereditare da lis_port (non restare 0)
+    cfg = {"lis_host": "10.9.0.10", "lis_port": 2576,
+           "vpn_health_check_host": "10.9.0.99", "vpn_health_check_port": 0}
+    resolve_vpn_health_check(cfg)
+    assert cfg["vpn_health_check_host"] == "10.9.0.99", "l'host esplicito non deve essere sovrascritto"
+    assert cfg["vpn_health_check_port"] == 2576, "la porta non impostata deve ereditare da lis_port"
+
+    # solo la porta impostata -> l'host non impostato eredita da lis_host, la porta esplicita resta intatta
+    cfg = {"lis_host": "10.9.0.10", "lis_port": 2576,
+           "vpn_health_check_port": 9999}
+    resolve_vpn_health_check(cfg)
+    assert cfg["vpn_health_check_host"] == "10.9.0.10"
+    assert cfg["vpn_health_check_port"] == 9999, "la porta esplicita non deve essere sovrascritta da lis_port"
+
+    print("[9] resolve_vpn_health_check: fallback host/porta indipendenti su lis_host/lis_port  OK")
+
+
+def test_vpn_openvpn_daemon_pidfile_stop():
+    """provider=openvpn con solo vpn_config_path (nessuna interface/unit systemd):
+    up() avvia 'openvpn --config ... --daemon --writepid <pidfile>'; poiche'
+    _default_down_command() non ha nulla da fermare in questo caso (bug: down()
+    era un no-op silenzioso, il processo sopravviveva a stop/riavvio del
+    middleware), down() deve leggere il pidfile e terminare quel PID."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = str(Path(tmpdir) / "openvpn.conf")
+        Path(config_path).write_text("# config fittizia\n")
+        pid_file = Path(f"{config_path}.pid")
+
+        # Simula il processo "daemon" avviato da --writepid: un processo reale
+        # di lunga durata di cui teniamo il PID nel pidfile, come farebbe openvpn.
+        proc = subprocess.Popen(["sleep", "30"])
+        pid_file.write_text(str(proc.pid))
+
+        mgr = vpn.VpnManager(provider="openvpn", manage_lifecycle=True, config_path=config_path)
+        mgr.down()
+
+        assert proc.wait(timeout=5) != 0, "il processo doveva essere terminato da SIGTERM"
+        assert not pid_file.exists(), "il pidfile va rimosso dopo lo stop"
+        print("[10] VpnManager: openvpn --daemon (senza interface/systemd) fermato via pidfile  OK")
+
+        # pidfile assente (mai avviato da questo middleware, o gia' terminato):
+        # down() deve segnalarlo con VpnError, non restare silenziosa.
+        mgr2 = vpn.VpnManager(provider="openvpn", manage_lifecycle=True, config_path=config_path)
+        try:
+            mgr2.down()
+            assert False, "down() doveva sollevare VpnError senza pidfile"
+        except vpn.VpnError:
+            pass
+        print("[11] VpnManager: down() senza pidfile openvpn --daemon solleva VpnError  OK")
+
+
 if __name__ == "__main__":
     test_parse_adt()
     test_full_flow_replacing_cchs()
@@ -249,4 +314,6 @@ if __name__ == "__main__":
     test_dedicated_adt_channel()
     test_vpn_health_check()
     test_vpn_from_config_disabled()
+    test_resolve_vpn_health_check_independent_fallback()
+    test_vpn_openvpn_daemon_pidfile_stop()
     print("\nTUTTI I TEST CITIZENCARE OK")

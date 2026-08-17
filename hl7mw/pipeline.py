@@ -66,9 +66,11 @@ class OrderReceiver:
         except hl7.Hl7Error as e:
             LOG.warning("ADT non valido rifiutato: %s", e)
             return hl7.build_ack(message, "AR", str(e), self.sending_app, self.sending_facility)
-        patient_id = adt["patient"].get("id", "")
-        self.store.audit_log("patient_registered", details=f"ADT {adt['event_type']} patient={patient_id}")
-        LOG.info("Paziente registrato dal LIS: id=%s evento=%s", patient_id, adt["event_type"])
+        # Niente identificativi paziente in log/audit (SECURITY_PRIVACY.md: "no PHI
+        # nei technical logs") — solo il tipo di evento, coerente con l'audit degli
+        # ordini (order_received) che logga sample_key ma mai i dati del paziente.
+        self.store.audit_log("patient_registered", details=f"ADT {adt['event_type']}")
+        LOG.info("Registrazione paziente ricevuta dal LIS: evento=%s", adt["event_type"])
         return hl7.build_ack(message, "AA", "", self.sending_app, self.sending_facility)
 
     def start(self):
@@ -108,14 +110,14 @@ class ResultReceiver:
             self.monitor.record_message(device_name)
 
         if not order:
-            self.store.add_unmatched(result)
+            self.store.add_unmatched(result, source_instrument=device_name)
             self.store.audit_log("result_unmatched", sample_key=key,
                                 instrument=device_name,
                                 details=f"No matching order")
             LOG.warning("Risultato senza ordine corrispondente: sample=%s -> unmatched", key)
             return hl7.build_ack(message, "AA", "", self.sending_app, self.sending_facility)
 
-        self.store.add_result(key, result)
+        self.store.add_result(key, result, source_instrument=device_name)
         timing = self.store.get_timing(key)
         if not timing or not timing.get("first_result_at"):
             self.store.record_timing(key, "first_result")
