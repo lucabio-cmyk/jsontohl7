@@ -11,6 +11,8 @@ stato su SQLite). Mantieni questa proprietà salvo decisione esplicita.
 ## WHAT
 Tre flussi (in `hl7mw/pipeline.py`):
 1. `OrderReceiver` — server MLLP, riceve ORM/OML dal LIS, salva l'ordine, risponde ACK.
+   Riceve anche ADT^A0x (registrazione paziente, es. Citizen Care Connect): ACK
+   positivo, nessun ordine creato (vedi `_handle_adt`, `hl7.parse_adt`).
 2. `ResultReceiver` — server MLLP, riceve ORU dagli strumenti, **associa** all'ordine.
 3. `Forwarder` — ordini `READY` → ORU^R01 → LIS, gestisce l'ACK.
 
@@ -70,23 +72,20 @@ python3 -m hl7mw.cli --db hl7mw.db unmatched       # risultati orfani
 - Traccia msg count per device
 - Audit log per cambio status (INFO online, WARNING offline)
 
-## Adapter Citizen Care Connect (CCHS) + VPN
+## LIS Citizen Care Connect (CCHS) + VPN
 
-Fornitore esterno che riceve ordini e restituisce risultati via HL7 (vedi
-`INTEGRATION_CITIZENCARE.md`). Gioca il ruolo di uno strumento raggiunto via VPN
-site-to-site invece che via rete locale:
+CCHS è **un LIS**, non uno strumento (il loro documento HL7 spec è indirizzato
+a chi sviluppa il connettore lato LIS/EMR — vedi `INTEGRATION_CITIZENCARE.md`).
+Nessun adapter dedicato: usa `OrderReceiver`/`Forwarder` esistenti, con
+`lis_host`/`lis_port` puntati a CCHS. L'unica estensione è il supporto ADT^A0x
+in `OrderReceiver` (sopra). Lo strumento fisico (es. HemoScreen) si collega
+come sempre tramite `adapters/hemoscreen_*.py`, indipendentemente da CCHS.
 
-- `hl7mw/adapters/citizencare.py` — `CitizenCareForwarder` (ordini `RECEIVED` →
-  `ADT^A04`+`ORM^O01` → CCHS, status `SENT_TO_CCHS`) e `CitizenCareResultReceiver`
-  (`ORU^R01` da CCHS → `pipeline.try_complete` standard → `READY`, poi il
-  `Forwarder` esistente lo inoltra al LIS). Matching per placer/filler order
-  number (CCHS non riceve/restituisce lo specimen barcode): vedi `Store.find_order`.
-- `hl7mw/vpn.py` — `VpnManager`: health-check sempre; avvio/arresto del tunnel
-  (wg-quick/openvpn/comando custom) solo se `vpn_manage_lifecycle: true`, altrimenti
-  gestito esternamente (systemd — consigliato in produzione). Solo stdlib
-  (subprocess/socket): niente crypto/tunneling reimplementato in Python.
-
-Abilitazione: `"citizencare_enabled": true` + `"vpn_enabled": true` in config.
+`hl7mw/vpn.py` — `VpnManager`: health-check sempre (default su `lis_host:lis_port`);
+avvio/arresto del tunnel (wg-quick/openvpn/comando custom) solo se
+`vpn_manage_lifecycle: true`, altrimenti gestito esternamente (systemd —
+consigliato in produzione, richiesto da CCHS per il loro Cloud Ingest Server).
+Solo stdlib (subprocess/socket): niente crypto/tunneling reimplementato in Python.
 Template VPN (WireGuard/OpenVPN) e guida setup in `vpn/README.md`.
 
 ## Da fare (priorità)
@@ -95,8 +94,9 @@ Template VPN (WireGuard/OpenVPN) e guida setup in `vpn/README.md`.
 2. Regola di **completezza** reale in `pipeline.try_complete` (test richiesti vs ricevuti).
 3. **Retry/backoff persistente** nel `Forwarder` (storico retry, DLQ).
 4. **Sicurezza**: TLS sul MLLP, autenticazione API, RBAC dashboard.
-5. Adapter CitizenCare: supporto `ADT^A08` (update paziente, dichiarato da CCHS ma
-   non ancora implementato); eventuale segmento SPM nell'ORM se CCHS arriva a supportarlo.
+5. Supporto esplicito `ADT^A08` (update paziente, dichiarato da CCHS ma non
+   ancora distinto da A04 in `_handle_adt`, che oggi tratta tutti gli ADT allo
+   stesso modo: ACK positivo, nessuna persistenza).
 
 ## Attenzione (dominio sanitario)
 Dati clinici reali: niente dati paziente nei log/commit, attenzione a sicurezza del

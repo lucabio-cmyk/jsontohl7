@@ -6,8 +6,6 @@ strumenti, loro associazione e ciclo di vita. Query pronte per alimentare la UI.
 
 Ciclo di vita di un ordine (colonna orders.status):
   RECEIVED         ordine ricevuto dal LIS e ACKato
-  SENT_TO_CCHS     (solo se adapter CitizenCare abilitato) ADT^A04+ORM^O01 inoltrati
-                   a Citizen Care Connect, in attesa dell'ORU^R01 di risposta
   RESULTS_PARTIAL  arrivati alcuni risultati ma l'ordine non e' completo
   READY            risultati completi, pronto per l'inoltro al LIS
   FORWARDING       inoltro in corso
@@ -139,31 +137,6 @@ class Store:
         with self._conn() as c:
             row = c.execute("SELECT * FROM orders WHERE sample_key=?", (sample_key,)).fetchone()
             return dict(row) if row else None
-
-    def find_order(self, sample_key: str = "", filler_order_number: str = "",
-                    placer_order_number: str = "") -> dict | None:
-        """Cerca un ordine per sample_key; se non trovato, fallback su filler/placer
-        order number. Utile quando il sistema a valle (es. un fornitore esterno come
-        Citizen Care Connect) non ha modo di riecheggiare lo stesso identificativo
-        usato come sample_key primario (es. uno specimen barcode mai comunicato)."""
-        if sample_key:
-            order = self.get_order(sample_key)
-            if order:
-                return order
-        with self._conn() as c:
-            if filler_order_number:
-                row = c.execute(
-                    "SELECT * FROM orders WHERE filler_order_number=?", (filler_order_number,)
-                ).fetchone()
-                if row:
-                    return dict(row)
-            if placer_order_number:
-                row = c.execute(
-                    "SELECT * FROM orders WHERE placer_order_number=?", (placer_order_number,)
-                ).fetchone()
-                if row:
-                    return dict(row)
-        return None
 
     def set_status(self, sample_key: str, status: str, error: str | None = None) -> None:
         with self._conn() as c:

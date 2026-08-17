@@ -12,8 +12,9 @@
 #
 # In config.json del middleware, con tunnel gestito da systemd (consigliato):
 #   "vpn_enabled": true, "vpn_manage_lifecycle": false,
+#   "lis_host": "<IP interno CCHS lato tunnel>", "lis_port": <porta ORU CCHS>,
 #   "vpn_health_check_host": "<IP interno CCHS lato tunnel>",
-#   "vpn_health_check_port": <porta ADT/ORM CCHS>
+#   "vpn_health_check_port": <porta ORU CCHS>  (default: uguale a lis_host/lis_port)
 
 [Interface]
 # Chiave privata di QUESTO host (generare con: wg genkey | tee wg-cchs.key | wg pubkey > wg-cchs.pub)

@@ -144,9 +144,9 @@ class VpnManager:
     def ensure_up(self) -> bool:
         """Avvia (se richiesto) e verifica il tunnel. Ritorna True se l'endpoint
         e' raggiungibile. Non solleva per errori di raggiungibilità: logga e
-        ritorna False, così il middleware resta comunque in piedi (gli invii verso
-        CCHS falliranno con errore transitorio e verranno ritentati automaticamente,
-        vedi adapters.citizencare.CitizenCareForwarder)."""
+        ritorna False, così il middleware resta comunque in piedi (l'inoltro
+        al LIS fallirà con errore transitorio e verrà ritentato automaticamente
+        dal loop principale, vedi pipeline.Forwarder)."""
         try:
             self.up()
         except VpnError as e:

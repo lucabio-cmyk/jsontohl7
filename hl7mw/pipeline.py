@@ -34,6 +34,9 @@ class OrderReceiver:
         self._server: mllp.MllpServer | None = None
 
     def _handle(self, message: str) -> str:
+        mtype = hl7.msh_field(hl7.split_segments(message), 9)
+        if mtype.startswith("ADT"):
+            return self._handle_adt(message)
         try:
             order = hl7.parse_order(message)
         except hl7.Hl7Error as e:
@@ -50,6 +53,22 @@ class OrderReceiver:
         try_complete(self.store, order["sample_key"])
         LOG.info("Ordine ricevuto dal LIS: sample=%s test=%s",
                  order["sample_key"], order["universal_service_id"].get("text"))
+        return hl7.build_ack(message, "AA", "", self.sending_app, self.sending_facility)
+
+    def _handle_adt(self, message: str) -> str:
+        """ADT^A0x (es. A04 registrazione paziente): alcuni LIS lo inviano prima
+        dell'ordine vero e proprio (es. Citizen Care Connect, spec CCHS §4.1). Non
+        crea un ordine: l'ORM^O01 che segue porta gia' i dati paziente necessari
+        (vedi hl7.parse_order/_patient). Qui riscontriamo solo con ACK positivo,
+        cosi' il mittente non considera fallita la registrazione."""
+        try:
+            adt = hl7.parse_adt(message)
+        except hl7.Hl7Error as e:
+            LOG.warning("ADT non valido rifiutato: %s", e)
+            return hl7.build_ack(message, "AR", str(e), self.sending_app, self.sending_facility)
+        patient_id = adt["patient"].get("id", "")
+        self.store.audit_log("patient_registered", details=f"ADT {adt['event_type']} patient={patient_id}")
+        LOG.info("Paziente registrato dal LIS: id=%s evento=%s", patient_id, adt["event_type"])
         return hl7.build_ack(message, "AA", "", self.sending_app, self.sending_facility)
 
     def start(self):

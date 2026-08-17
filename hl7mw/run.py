@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 hl7mw.run — avvia il middleware completo:
-  - OrderReceiver  (ordini dal LIS)
+  - OrderReceiver  (ordini dal LIS: ORM/OML, + ADT^A0x di registrazione paziente)
   - ResultReceiver (risultati dagli strumenti)
   - Forwarder      (loop periodico: ordini READY -> ORU -> LIS)
   - status web     (pagina/JSON di stato per la UI, opzionale)
-  - CitizenCare    (opzionale: inoltro ordini + ricezione risultati da CCHS via VPN)
+  - vpn            (opzionale: verifica/avvio tunnel VPN verso il LIS, es. Citizen Care Connect)
 
 Uso:
     python3 -m hl7mw.run -c config.json
@@ -28,7 +28,6 @@ from .monitor import DeviceMonitor
 from .webstatus import StatusServer
 from .adapters.hemoscreen_hl7 import HemoscreenHl7ResultReceiver
 from .adapters.hemoscreen_poct1a2 import HemoscreenPoct1A2Receiver
-from .adapters.citizencare import CitizenCareConfig, CitizenCareForwarder, CitizenCareResultReceiver
 
 try:
     from .api import init_api
@@ -63,22 +62,15 @@ DEFAULTS = {
     "hemoscreen_poct1a2_port": 6664,
     "hemoscreen_poct1a2_continuous_mode": False,
     "hemoscreen_poct1a2_timeout": 65.0,
-    # Adapter Citizen Care Connect (CCHS) — vedi INTEGRATION_CITIZENCARE.md
-    "citizencare_enabled": False,
-    "citizencare_host": "", "citizencare_port": 0,                          # ADT/ORM in uscita verso CCHS
-    "citizencare_result_listen_host": "0.0.0.0", "citizencare_result_listen_port": 6665,  # ORU in ingresso da CCHS
-    "citizencare_sending_app": "", "citizencare_sending_facility": "",       # default: sending_app/facility globali
-    "citizencare_receiving_app": "CCHS", "citizencare_receiving_facility": "CITIZENCARE",
-    "citizencare_ack_retry_attempts": 2, "citizencare_ack_retry_backoff_seconds": 0.5,
-    "citizencare_connect_timeout": 10.0, "citizencare_read_timeout": 30.0,
-    # VPN site-to-site verso il fornitore (es. CCHS) — vedi hl7mw/vpn.py
+    # VPN site-to-site verso il LIS (es. Citizen Care Connect richiede un tunnel
+    # site-to-site verso il loro Cloud Ingest Server) — vedi hl7mw/vpn.py e vpn/README.md
     "vpn_enabled": False,
     "vpn_provider": "external",       # wireguard | openvpn | external
     "vpn_interface": "",
     "vpn_config_path": "",
     "vpn_up_command": "", "vpn_down_command": "",
     "vpn_manage_lifecycle": False,    # False = tunnel gestito fuori dal middleware (systemd/appliance)
-    "vpn_health_check_host": "", "vpn_health_check_port": 0,
+    "vpn_health_check_host": "", "vpn_health_check_port": 0,   # default: lis_host/lis_port se non specificato
     "vpn_health_check_timeout": 5.0,
     "vpn_wait_seconds": 20.0, "vpn_poll_interval": 1.0,
 }
@@ -110,11 +102,12 @@ def main(argv=None) -> int:
 
     vpn_manager = None
     if cfg.get("vpn_enabled"):
-        # Se non specificato esplicitamente, l'health-check punta all'endpoint CCHS:
-        # e' quello che deve essere raggiungibile attraverso il tunnel.
-        if not cfg.get("vpn_health_check_host") and cfg.get("citizencare_enabled"):
-            cfg["vpn_health_check_host"] = cfg.get("citizencare_host")
-            cfg["vpn_health_check_port"] = cfg.get("citizencare_port")
+        # Se non specificato esplicitamente, l'health-check punta al LIS
+        # (lis_host/lis_port): e' l'endpoint che deve essere raggiungibile
+        # attraverso il tunnel per poter inoltrare gli ORU.
+        if not cfg.get("vpn_health_check_host"):
+            cfg["vpn_health_check_host"] = cfg.get("lis_host")
+            cfg["vpn_health_check_port"] = cfg.get("lis_port")
         vpn_manager = vpnmod.from_config(cfg)
         vpn_manager.ensure_up()  # non bloccante: logga ed eventualmente ritenta nel loop
 
@@ -173,27 +166,6 @@ def main(argv=None) -> int:
             timeout=cfg["hemoscreen_poct1a2_timeout"],
         ).start()
 
-    cc_forwarder = None
-    cc_receiver = None
-    if cfg.get("citizencare_enabled"):
-        cc_cfg = CitizenCareConfig(
-            sending_app=cfg.get("citizencare_sending_app") or cfg["sending_app"],
-            sending_facility=cfg.get("citizencare_sending_facility") or cfg["sending_facility"],
-            receiving_app=cfg.get("citizencare_receiving_app", "CCHS"),
-            receiving_facility=cfg.get("citizencare_receiving_facility", "CITIZENCARE"),
-        )
-        cc_forwarder = CitizenCareForwarder(
-            store, cfg["citizencare_host"], cfg["citizencare_port"], cc_cfg,
-            connect_timeout=cfg.get("citizencare_connect_timeout", 10.0),
-            read_timeout=cfg.get("citizencare_read_timeout", 30.0),
-            ack_retry_attempts=cfg.get("citizencare_ack_retry_attempts", 2),
-            ack_retry_backoff_seconds=cfg.get("citizencare_ack_retry_backoff_seconds", 0.5),
-        )
-        cc_receiver = CitizenCareResultReceiver(
-            store, cfg["citizencare_result_listen_host"], cfg["citizencare_result_listen_port"],
-            cc_cfg.sending_app, cc_cfg.sending_facility, monitor,
-        ).start()
-
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
     LOG.info("Middleware avviato. Ctrl-C per fermare.")
@@ -202,8 +174,6 @@ def main(argv=None) -> int:
         while not _STOP:
             try:
                 forwarder.forward_ready()
-                if cc_forwarder:
-                    cc_forwarder.forward_new_orders()
             except Exception:
                 LOG.exception("Errore nel loop di inoltro; continuo.")
             slept = 0.0
@@ -219,8 +189,6 @@ def main(argv=None) -> int:
             hs_hl7.stop()
         if hs_poct:
             hs_poct.stop()
-        if cc_receiver:
-            cc_receiver.stop()
         if vpn_manager:
             vpn_manager.down()
         LOG.info("Middleware arrestato.")

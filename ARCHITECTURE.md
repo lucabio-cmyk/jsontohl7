@@ -21,7 +21,9 @@ al LIS come risultati strutturati.
 
 Tre flussi:
 1. **LIS → middleware**: ordini in ingresso. Il LIS si connette e invia ORM^O01 /
-   OML^O21; il middleware risponde con ACK e persiste l'ordine.
+   OML^O21 (opzionalmente preceduto da un ADT^A0x di registrazione paziente, es.
+   Citizen Care Connect — riscontrato con ACK positivo, non genera un ordine);
+   il middleware risponde con ACK e persiste l'ordine.
 2. **Strumenti → middleware**: risultati in ingresso. Gli strumenti inviano i
    risultati; il middleware li associa all'ordine per chiave campione.
 3. **Middleware → LIS**: i risultati associati e completi vengono inoltrati al LIS
@@ -35,13 +37,12 @@ Tre flussi:
 
 | modulo            | responsabilità                                                        |
 |-------------------|-----------------------------------------------------------------------|
-| `hl7.py`          | parsing/costruzione HL7v2: `parse_order`, `parse_result`, `build_ack`, `build_oru` |
+| `hl7.py`          | parsing/costruzione HL7v2: `parse_order`, `parse_adt`, `parse_result`, `build_ack`, `build_oru` |
 | `mllp.py`         | trasporto MLLP: client (`send_message`/`exchange`) e server (`MllpServer`) |
 | `store.py`        | persistenza SQLite: ordini, risultati, orfani, ciclo di vita, query UI |
-| `pipeline.py`     | `OrderReceiver`, `ResultReceiver`, `Forwarder` + regola di associazione |
+| `pipeline.py`     | `OrderReceiver` (ORM/OML + ADT^A0x), `ResultReceiver`, `Forwarder` + regola di associazione |
 | `webstatus.py`    | endpoint di stato di sola lettura (aggancio per la UI)                 |
-| `adapters/citizencare.py` | `CitizenCareForwarder`/`CitizenCareResultReceiver`: fornitore esterno CCHS come "strumento" via VPN (vedi `INTEGRATION_CITIZENCARE.md`) |
-| `vpn.py`          | avvio/verifica opzionale del tunnel VPN verso fornitori esterni       |
+| `vpn.py`          | avvio/verifica opzionale del tunnel VPN verso il LIS (es. Citizen Care Connect, vedi `INTEGRATION_CITIZENCARE.md`) |
 | `run.py`          | runner del servizio: avvia i receiver + loop del forwarder            |
 
 ## Associazione (matching)
@@ -79,15 +80,16 @@ in `ERROR` con `last_error`.
 
 ## Porte e rete
 
-- Ordini dal LIS: server MLLP su `order_listen_port` (default 6661).
+- Ordini dal LIS: server MLLP su `order_listen_port` (default 6661), anche per
+  l'ADT^A0x di registrazione paziente quando il LIS lo invia (es. Citizen Care
+  Connect, vedi `INTEGRATION_CITIZENCARE.md`).
 - Risultati dagli strumenti: server MLLP su `result_listen_port` (default 6662).
 - Inoltro al LIS: client MLLP verso `lis_host:lis_port`.
 - La VPN/connettività è a carico del SO; il middleware si limita a usare gli endpoint
-  (vedi `vpn.py`: health-check sempre, avvio/arresto del tunnel solo se
-  `vpn_manage_lifecycle: true`, altrimenti gestito da systemd/appliance esterna).
-- Fornitore esterno CCHS: ADT/ORM in uscita verso `citizencare_host:citizencare_port`,
-  ORU in ingresso su `citizencare_result_listen_port` — entrambi tipicamente dentro
-  il tunnel VPN. Vedi `INTEGRATION_CITIZENCARE.md`.
+  (vedi `vpn.py`: health-check sempre su `lis_host:lis_port` (default), avvio/arresto
+  del tunnel solo se `vpn_manage_lifecycle: true`, altrimenti gestito da
+  systemd/appliance esterna — es. quando il LIS richiede un tunnel site-to-site
+  come Citizen Care Connect).
 
 ## Decisioni tecniche
 
