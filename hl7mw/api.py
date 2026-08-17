@@ -10,14 +10,22 @@ Rimpiazza webstatus.py con operazioni complete:
 from __future__ import annotations
 
 import json
+import logging
+from pathlib import Path
 from typing import Optional
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .store import Store
+from . import vpn as vpnmod
+from .adapters import hemoscreen_poct1a2 as poct1a2
+
+LOG = logging.getLogger("hl7mw")
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="HL7 Middleware API", version="1.0.0")
 
@@ -29,12 +37,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_store: Store | None = None
 
-def init_api(store: Store) -> FastAPI:
-    """Inizializza API con referenza al database."""
-    global _store
+@app.exception_handler(Exception)
+async def _log_unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    """Ultima rete di sicurezza: qualunque eccezione non gestita esplicitamente
+    da un endpoint (bug, errore DB, ecc.) va comunque nel log applicativo con
+    lo stack trace completo prima di rispondere 500 — altrimenti chi guarda la
+    dashboard vede solo un errore generico, senza nessuna traccia server-side
+    di cosa sia realmente successo."""
+    LOG.exception("API %s %s: eccezione non gestita", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Errore interno del server"})
+
+_store: Store | None = None
+_config_path: str = "config.json"
+_config_defaults: dict = {}
+
+def init_api(store: Store, config_path: str = "config.json", defaults: dict | None = None) -> FastAPI:
+    """Inizializza API con referenza al database e al file di configurazione
+    (per la pagina Impostazioni: GET/PUT /api/config)."""
+    global _store, _config_path, _config_defaults
     _store = store
+    _config_path = config_path
+    _config_defaults = dict(defaults or {})
     return app
 
 
@@ -42,6 +66,267 @@ def init_api(store: Store) -> FastAPI:
 async def health():
     """Health check."""
     return {"status": "ok"}
+
+
+def _read_config() -> dict:
+    cfg = dict(_config_defaults)
+    p = Path(_config_path)
+    if p.exists():
+        cfg.update(json.loads(p.read_text(encoding="utf-8")))
+    return cfg
+
+
+def _validate_config_update(payload: dict) -> dict:
+    """Valida il payload della GUI Impostazioni contro le chiavi/i tipi noti
+    (hl7mw.run.DEFAULTS): rifiuta chiavi sconosciute, coerce i tipi. Non c'e'
+    validazione applicativa più fine (es. range porte): resta responsabilita'
+    dell'operatore, coerente con l'assenza di autenticazione sull'API (vedi
+    CLAUDE.md 'Da fare' — TLS/auth)."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Payload non valido: atteso un oggetto JSON")
+    unknown = sorted(set(payload) - set(_config_defaults))
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Chiavi di configurazione sconosciute: {unknown}")
+    validated: dict = {}
+    for key, value in payload.items():
+        expected = type(_config_defaults[key])
+        try:
+            if expected is bool:
+                if not isinstance(value, bool):
+                    raise ValueError
+                validated[key] = value
+            elif expected is int:
+                validated[key] = int(value)
+            elif expected is float:
+                validated[key] = float(value)
+            else:
+                validated[key] = "" if value is None else str(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{key}: valore non valido per il tipo atteso ({expected.__name__})")
+    return validated
+
+
+@app.get("/api/config")
+async def get_config():
+    """Configurazione corrente (default + config.json), per la pagina Impostazioni."""
+    p = Path(_config_path)
+    return {"config": _read_config(), "config_path": str(p), "file_exists": p.exists()}
+
+
+@app.put("/api/config")
+async def update_config(payload: dict):
+    """Salva la configurazione su file. Non applicata a runtime: i componenti
+    (LIS, VPN, adapter strumenti) sono inizializzati una sola volta all'avvio —
+    serve un riavvio del servizio perché le modifiche abbiano effetto."""
+    validated = _validate_config_update(payload)
+    cfg = _read_config()
+    cfg.update(validated)
+    p = Path(_config_path)
+    try:
+        p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError as e:
+        LOG.error("API: scrittura di %s fallita: %s", p, e)
+        raise HTTPException(status_code=500, detail=f"Scrittura di {p} fallita: {e}")
+    if _store:
+        _store.audit_log("config_updated", details=f"{sorted(validated)}", severity="INFO")
+    LOG.info("API: configurazione aggiornata (%s) -> %s", sorted(validated), p)
+    return {"status": "ok", "config_path": str(p), "restart_required": True}
+
+
+@app.get("/api/vpn/check")
+async def check_vpn(host: str = Query(...), port: int = Query(..., ge=1, le=65535),
+                    timeout: float = Query(5.0, ge=0.1, le=30.0)):
+    """Verifica on-demand la raggiungibilita' TCP di host:port (tipicamente
+    attraverso il tunnel VPN esistente) — non avvia/ferma nessun tunnel."""
+    mgr = vpnmod.VpnManager(health_check_host=host, health_check_port=port, health_check_timeout=timeout)
+    return {"host": host, "port": port, "reachable": mgr.is_reachable()}
+
+
+def _vpn_manager_from_saved_config() -> vpnmod.VpnManager:
+    """Costruisce il VpnManager dalla configurazione SALVATA su disco (non da
+    eventuali modifiche non ancora salvate nel form): avviare/fermare un
+    tunnel reale in base a valori non salvati sarebbe fonte di errori."""
+    cfg = _read_config()
+    mgr = vpnmod.from_config(cfg)
+    if not mgr:
+        raise HTTPException(status_code=400, detail="vpn_enabled e' false nella configurazione salvata")
+    if not mgr.manage_lifecycle:
+        raise HTTPException(
+            status_code=400,
+            detail="vpn_manage_lifecycle e' false: il tunnel e' gestito esternamente (systemd/appliance), "
+                   "il middleware non lo avvia/ferma",
+        )
+    return mgr
+
+
+@app.post("/api/vpn/up")
+async def start_vpn():
+    """Avvia il tunnel (solo se vpn_enabled + vpn_manage_lifecycle nella
+    configurazione salvata): wg-quick/openvpn/comando custom, vedi hl7mw/vpn.py."""
+    mgr = _vpn_manager_from_saved_config()
+    try:
+        mgr.up()
+    except vpnmod.VpnError as e:
+        LOG.error("API: avvio tunnel VPN fallito (provider=%s): %s", mgr.provider, e)
+        raise HTTPException(status_code=500, detail=str(e))
+    if _store:
+        _store.audit_log("vpn_up_triggered", details=f"provider={mgr.provider}", severity="INFO")
+    LOG.info("API: tunnel VPN avviato on-demand (provider=%s)", mgr.provider)
+    return {"status": "ok"}
+
+
+@app.post("/api/vpn/down")
+async def stop_vpn():
+    """Ferma il tunnel (solo se vpn_enabled + vpn_manage_lifecycle nella
+    configurazione salvata)."""
+    mgr = _vpn_manager_from_saved_config()
+    try:
+        mgr.down()
+    except vpnmod.VpnError as e:
+        LOG.error("API: arresto tunnel VPN fallito (provider=%s): %s", mgr.provider, e)
+        raise HTTPException(status_code=500, detail=str(e))
+    if _store:
+        _store.audit_log("vpn_down_triggered", details=f"provider={mgr.provider}", severity="INFO")
+    LOG.info("API: tunnel VPN fermato on-demand (provider=%s)", mgr.provider)
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Gestione strumento HemoScreen (POCT1-A2) — direttive verso il device
+# ---------------------------------------------------------------------------
+# Il device POCT1-A2 e' sempre l'iniziatore della connessione TCP: queste
+# direttive non vengono "spedite" a un indirizzo, ma accodate nella
+# conversazione attiva (in-process, vedi hl7mw/adapters/hemoscreen_poct1a2.py)
+# e recapitate al primo punto protocollarmente sicuro. 404 se nessun device
+# risulta connesso in questo momento a questo processo (uno strumento spento
+# o collegato a un'altra istanza del middleware non e' raggiungibile da qui).
+
+def _require_device(device_id: str, ok: bool) -> None:
+    if not ok:
+        LOG.warning("API: direttiva HemoScreen richiesta per device non connesso: %s", device_id)
+        raise HTTPException(
+            status_code=404,
+            detail=f"Nessun device POCT1-A2 connesso corrispondente a '{device_id}' "
+                   f"in questo momento (strumento spento o non collegato).",
+        )
+
+
+def _audit_directive(event_type: str, device_id: str, details: str | None = None,
+                     severity: str = "INFO") -> None:
+    """Traccia una direttiva HemoScreen accodata sia sull'audit clinico (DB,
+    tracciabilita' — vedi store.audit_log) sia sul log tecnico applicativo
+    (file, per il troubleshooting operativo)."""
+    if _store:
+        _store.audit_log(event_type, instrument=device_id, details=details, severity=severity)
+    log_fn = LOG.warning if severity == "WARNING" else LOG.info
+    log_fn("API: %s device=%s%s", event_type, device_id, f" ({details})" if details else "")
+
+
+@app.get("/api/hemoscreen/devices")
+async def hemoscreen_devices():
+    """Elenco device_id/serial delle conversazioni POCT1-A2 attualmente connesse
+    a questo processo."""
+    return {"devices": poct1a2.connected_devices()}
+
+
+@app.post("/api/hemoscreen/{device_id}/lock")
+async def hemoscreen_lock(device_id: str):
+    """Accoda la direttiva LOCK (DTV.R01): impedisce ulteriori analisi sul device."""
+    ok = poct1a2.send_lock(device_id)
+    _require_device(device_id, ok)
+    _audit_directive("poct1a2_lock_queued", device_id, severity="WARNING")
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/unlock")
+async def hemoscreen_unlock(device_id: str):
+    """Accoda la direttiva UNLOCK (DTV.R01): ripristina il device dopo un LOCK."""
+    ok = poct1a2.send_unlock(device_id)
+    _require_device(device_id, ok)
+    _audit_directive("poct1a2_unlock_queued", device_id)
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/set-time")
+async def hemoscreen_set_time(device_id: str, payload: dict | None = None):
+    """Accoda SET_TIME (DTV.R02): imposta l'orologio del device sull'ora locale
+    dell'Observation Reviewer (questo middleware), oppure su payload['dttm']
+    (ISO 8601) se specificato."""
+    dt = None
+    if payload and payload.get("dttm"):
+        try:
+            dt = datetime.fromisoformat(str(payload["dttm"]))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="dttm non valido: atteso ISO 8601")
+    ok = poct1a2.send_set_time(device_id, dt)
+    _require_device(device_id, ok)
+    _audit_directive("poct1a2_set_time_queued", device_id)
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/operator-list")
+async def hemoscreen_operator_list(device_id: str, payload: dict):
+    """Accoda OPL.R01: lista operatori completa (sostituisce quella nel device).
+    payload: {"operators": [{"operator_id","permission_level_cd","method_cd"?}]}."""
+    operators = payload.get("operators")
+    if not isinstance(operators, list):
+        raise HTTPException(status_code=400, detail="Campo 'operators' (lista) obbligatorio")
+    ok = poct1a2.send_operator_list(device_id, operators)
+    _require_device(device_id, ok)
+    _audit_directive("poct1a2_operator_list_queued", device_id, details=f"{len(operators)} operatori")
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/operator-list-incremental")
+async def hemoscreen_operator_list_incremental(device_id: str, payload: dict):
+    """Accoda OPL.R02: aggiornamento incrementale operatori.
+    payload: {"updates": [{"action_cd":"D"|"I","operators":[...]}]}."""
+    updates = payload.get("updates")
+    if not isinstance(updates, list):
+        raise HTTPException(status_code=400, detail="Campo 'updates' (lista) obbligatorio")
+    ok = poct1a2.send_operator_list_incremental(device_id, updates)
+    _require_device(device_id, ok)
+    _audit_directive("poct1a2_operator_list_incremental_queued", device_id,
+                     details=f"{len(updates)} aggiornamenti")
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/qc-lot")
+async def hemoscreen_qc_lot(device_id: str, payload: dict):
+    """Accoda DTV.PIX.QC: un lotto di controllo qualita'.
+    payload: {"lot_number","expiration_date","revision","levels":{"H"|"N"|"L":[{...}]}}."""
+    for field in ("lot_number", "expiration_date", "revision", "levels"):
+        if field not in payload:
+            raise HTTPException(status_code=400, detail=f"Campo '{field}' obbligatorio")
+    ok = poct1a2.send_qc_lot(device_id, payload["lot_number"], payload["expiration_date"],
+                              payload["revision"], payload["levels"])
+    _require_device(device_id, ok)
+    _audit_directive("poct1a2_qc_lot_queued", device_id, details=payload["lot_number"])
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/gender-normal-range")
+async def hemoscreen_gender_normal_range(device_id: str, payload: dict):
+    """Accoda DTV.PIX.FB: range di normalita' per genere.
+    payload: {"effective_date","genders":{"M"|"F":[{...}]}}."""
+    for field in ("effective_date", "genders"):
+        if field not in payload:
+            raise HTTPException(status_code=400, detail=f"Campo '{field}' obbligatorio")
+    ok = poct1a2.send_gender_normal_range(device_id, payload["effective_date"], payload["genders"])
+    _require_device(device_id, ok)
+    _audit_directive("poct1a2_gender_normal_range_queued", device_id)
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/device-setup")
+async def hemoscreen_device_setup(device_id: str, payload: dict):
+    """Accoda DTV.PIX.DVCSET: setup strumento (modo operativo, lingua, unita' di
+    misura, parametri visualizzati, demografia, lockdown) — vedi
+    hl7mw/adapters/hemoscreen_poct1a2.py:build_dtv_pix_dvcset per la struttura attesa."""
+    ok = poct1a2.send_device_setup(device_id, payload)
+    _require_device(device_id, ok)
+    _audit_directive("poct1a2_device_setup_queued", device_id)
+    return {"status": "queued"}
 
 
 @app.get("/api/dashboard")
@@ -235,10 +520,44 @@ async def get_audit_log(
     return [dict(r) for r in rows]
 
 
+def _tail_lines(path: Path, n: int) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return "\n".join(text.splitlines()[-n:])
+
+
+@app.get("/api/logs")
+async def get_logs(lines: int = Query(200, ge=1, le=5000)):
+    """Ultime righe del log applicativo (file rotante, vedi hl7mw/logging_setup.py
+    e config log_file/log_level) — pensato per diagnosticare un problema dalla
+    dashboard senza bisogno di accesso SSH/shell alla macchina che esegue il
+    middleware. Diverso da /api/audit-log: quello e' la tracciabilita' clinica
+    (eventi strutturati su DB), questo e' il log tecnico dell'intero servizio
+    (MLLP, DB, VPN, API, incluse le eccezioni con stack trace)."""
+    log_file = _read_config().get("log_file") or ""
+    if not log_file:
+        raise HTTPException(status_code=404, detail="Nessun file di log configurato (log_file vuoto in config)")
+    p = Path(log_file)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"File di log non trovato: {p}")
+    try:
+        content = _tail_lines(p, lines)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Lettura di {p} fallita: {e}")
+    return PlainTextResponse(content)
+
+
 @app.get("/")
 async def get_ui():
     """Serve la dashboard HTML."""
     return HTMLResponse(get_dashboard_html())
+
+
+@app.get("/static/chart.min.js")
+async def get_chart_js():
+    """Chart.js vendorizzato localmente (vedi hl7mw/static/): la dashboard non
+    deve dipendere da un CDN esterno raggiungibile — reti cliniche/di laboratorio
+    spesso bloccano l'accesso a internet per policy."""
+    return FileResponse(STATIC_DIR / "chart.umd.min.js", media_type="application/javascript")
 
 
 def get_dashboard_html() -> str:
@@ -249,7 +568,7 @@ def get_dashboard_html() -> str:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HL7 Middleware Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="/static/chart.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -344,6 +663,7 @@ def get_dashboard_html() -> str:
         .badge.unknown { background: #e2e3e5; color: #383d41; }
         .badge.received { background: #cfe2ff; color: #084298; }
         .badge.ready { background: #cff4fc; color: #055160; }
+        .badge.forwarding { background: #e2d9f3; color: #432874; }
         .badge.sent { background: #d4edda; color: #155724; }
         .badge.error { background: #f8d7da; color: #721c24; }
 
@@ -409,6 +729,7 @@ def get_dashboard_html() -> str:
             box-shadow: 0 4px 20px rgba(0,0,0,0.3);
         }
         .modal-content h2 { margin-bottom: 15px; }
+        .modal-content.wide { max-width: 900px; }
         .modal-content .close {
             float: right;
             font-size: 24px;
@@ -418,12 +739,59 @@ def get_dashboard_html() -> str:
         }
         .modal-content .close:hover { color: #333; }
 
+        .header-actions { float: right; }
+        .header { overflow: hidden; }
+
+        .settings-note {
+            background: #fff3cd;
+            color: #664d03;
+            padding: 10px 14px;
+            border-radius: 6px;
+            font-size: 12px;
+            margin-bottom: 15px;
+        }
+        .settings-section {
+            font-size: 13px;
+            font-weight: 600;
+            color: #667eea;
+            text-transform: uppercase;
+            margin: 20px 0 10px;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 6px;
+        }
+        .settings-section:first-of-type { margin-top: 0; }
+        .settings-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 12px 20px;
+        }
+        .settings-field { display: flex; flex-direction: column; font-size: 12px; color: #444; gap: 4px; }
+        .settings-field.checkbox { flex-direction: row; align-items: center; gap: 8px; font-size: 13px; }
+        .settings-field input[type=text], .settings-field input[type=number], .settings-field select {
+            padding: 6px 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .settings-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 20px;
+            padding-top: 15px;
+            border-top: 1px solid #eee;
+        }
+        #vpnCheckResult { font-size: 12px; font-weight: 600; }
+
         pre { background: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 11px; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
+            <div class="header-actions">
+                <button class="action-button" onclick="openSettings()">⚙ Impostazioni</button>
+            </div>
             <h1>HL7 Middleware — Dashboard</h1>
             <div class="subtitle">Monitoraggio ordini, strumenti, statistiche</div>
         </div>
@@ -463,6 +831,21 @@ def get_dashboard_html() -> str:
             </table>
             <div class="last-update">Aggiornamento automatico ogni 5s</div>
         </div>
+
+        <!-- Log applicativo -->
+        <div class="table-container">
+            <h3>Log Applicativo
+                <button class="action-button" onclick="loadLogs()"
+                        style="margin-left:10px;font-size:12px;padding:4px 10px;">↻ Aggiorna</button>
+            </h3>
+            <pre id="logContent" style="max-height:400px;overflow:auto;background:#1a1a2e;color:#d4d4d4;
+                 padding:12px;border-radius:6px;font-size:12px;line-height:1.4;white-space:pre-wrap;
+                 word-break:break-all;">Caricamento…</pre>
+            <div class="last-update">
+                Ultime 200 righe del log tecnico del servizio (MLLP, DB, VPN, API — non l'audit clinico).
+                Non aggiornato automaticamente: usa "Aggiorna".
+            </div>
+        </div>
     </div>
 
     <!-- Order Detail Modal -->
@@ -471,6 +854,24 @@ def get_dashboard_html() -> str:
             <span class="close" onclick="closeModal()">&times;</span>
             <h2 id="orderModalTitle">Dettaglio Ordine</h2>
             <div id="orderModalBody"></div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal" id="settingsModal">
+        <div class="modal-content wide">
+            <span class="close" onclick="closeSettings()">&times;</span>
+            <h2>Impostazioni</h2>
+            <div class="settings-note">
+                Le modifiche vengono salvate su <code id="settingsPath"></code> ma non applicate a
+                runtime: LIS, VPN e adapter strumenti sono inizializzati all'avvio — riavvia il
+                servizio dopo il salvataggio perché abbiano effetto.
+            </div>
+            <div id="settingsForm"></div>
+            <div class="settings-actions">
+                <button id="saveSettingsBtn" class="action-button" onclick="saveSettings()">Salva</button>
+                <button class="action-button danger" onclick="closeSettings()">Annulla</button>
+            </div>
         </div>
     </div>
 
@@ -484,12 +885,15 @@ def get_dashboard_html() -> str:
                 const statsResp = await fetch('/api/dashboard');
                 const stats = await statsResp.json();
                 renderStats(stats);
-                renderStatusChart(stats);
+                // Il grafico non deve poter bloccare il resto della dashboard
+                // (es. Chart.js non caricato): errori qui restano isolati.
+                try { renderStatusChart(stats); } catch (e) { console.error('Grafico non disponibile:', e); }
 
                 // Instruments
                 const instrResp = await fetch('/api/instruments');
                 const instruments = await instrResp.json();
                 renderInstruments(instruments);
+                try { renderInstrumentChart(instruments); } catch (e) { console.error('Grafico strumenti non disponibile:', e); }
 
                 // Orders
                 const ordersResp = await fetch('/api/orders?limit=20');
@@ -536,11 +940,38 @@ def get_dashboard_html() -> str:
             });
         }
 
+        function renderInstrumentChart(instruments) {
+            const ctx = document.getElementById('instrumentChart').getContext('2d');
+            if (instrumentChart) instrumentChart.destroy();
+
+            const colors = { ONLINE: '#27ae60', OFFLINE: '#e74c3c', UNKNOWN: '#95a5a6' };
+            const counts = {};
+            instruments.forEach(i => {
+                const s = (i.status || 'UNKNOWN').toUpperCase();
+                counts[s] = (counts[s] || 0) + 1;
+            });
+            const labels = Object.keys(counts);
+
+            instrumentChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: labels.map(l => counts[l]),
+                        backgroundColor: labels.map(l => colors[l] || '#3498db'),
+                        borderColor: 'white',
+                        borderWidth: 2,
+                    }],
+                },
+                options: { responsive: true, maintainAspectRatio: false },
+            });
+        }
+
         function renderInstruments(instruments) {
             document.getElementById('instruments').innerHTML = instruments.map(i =>
                 `<div class="instrument-card">
                     <div class="name">${i.name}</div>
-                    <div class="info"><strong>Host:</strong> ${i.host}:${i.port}</div>
+                    ${i.host ? `<div class="info"><strong>Host:</strong> ${i.host}${i.port ? ':' + i.port : ''}</div>` : ''}
                     <div class="info"><strong>Tipo:</strong> ${i.type}</div>
                     <div class="info"><strong>Status:</strong> <span class="badge ${i.status.toLowerCase()}">${i.status}</span></div>
                     <div class="info"><strong>Ultimi messaggi:</strong> ${i.last_message_at || 'mai'}</div>
@@ -597,7 +1028,7 @@ def get_dashboard_html() -> str:
         }
 
         async function retryOrder(sampleKey) {
-            if (!confirm('Riprovare l\'inoltro di questo ordine?')) return;
+            if (!confirm("Riprovare l'inoltro di questo ordine?")) return;
             const resp = await fetch(`/api/orders/${sampleKey}/retry`, { method: 'POST' });
             if (resp.ok) {
                 alert('Ordine rimesso in coda per retry');
@@ -618,9 +1049,223 @@ def get_dashboard_html() -> str:
             }
         }
 
+        // ---------------------------------------------------------------- Impostazioni
+        const CONFIG_FIELDS = [
+            // LIS
+            { key: 'lis_host', label: 'LIS — host', type: 'text', section: 'LIS' },
+            { key: 'lis_port', label: 'LIS — porta', type: 'number', section: 'LIS' },
+            { key: 'order_listen_host', label: 'Ordini (ADT+ORM) in ingresso — host', type: 'text', section: 'LIS' },
+            { key: 'order_listen_port', label: 'Ordini (ADT+ORM) in ingresso — porta', type: 'number', section: 'LIS' },
+            { key: 'adt_listen_host', label: 'Canale ADT dedicato (opz., vuoto = usa host sopra)', type: 'text', section: 'LIS' },
+            { key: 'adt_listen_port', label: 'Canale ADT dedicato — porta (0 = disabilitato, es. Dedalus)', type: 'number', section: 'LIS' },
+            { key: 'sending_app', label: 'Sending App (nostro)', type: 'text', section: 'LIS' },
+            { key: 'sending_facility', label: 'Sending Facility (nostro)', type: 'text', section: 'LIS' },
+            { key: 'receiving_app', label: 'Receiving App (LIS)', type: 'text', section: 'LIS' },
+            { key: 'receiving_facility', label: 'Receiving Facility (LIS)', type: 'text', section: 'LIS' },
+            { key: 'forward_interval_seconds', label: 'Intervallo inoltro (s)', type: 'number', step: '0.5', section: 'LIS' },
+            { key: 'ack_retry_attempts', label: 'Tentativi retry ACK', type: 'number', section: 'LIS' },
+            { key: 'ack_retry_backoff_seconds', label: 'Backoff retry (s)', type: 'number', step: '0.1', section: 'LIS' },
+
+            // Strumenti
+            { key: 'result_listen_host', label: 'Risultati in ingresso — host', type: 'text', section: 'Strumenti' },
+            { key: 'result_listen_port', label: 'Risultati in ingresso — porta', type: 'number', section: 'Strumenti' },
+            { key: 'device_offline_timeout_seconds', label: 'Timeout offline strumenti (s)', type: 'number', section: 'Strumenti' },
+            { key: 'hemoscreen_hl7_enabled', label: 'HemoScreen HL7 abilitato', type: 'checkbox', section: 'Strumenti' },
+            { key: 'hemoscreen_hl7_host', label: 'HemoScreen HL7 — host', type: 'text', section: 'Strumenti' },
+            { key: 'hemoscreen_hl7_port', label: 'HemoScreen HL7 — porta', type: 'number', section: 'Strumenti' },
+            { key: 'hemoscreen_poct1a2_enabled', label: 'HemoScreen POCT1-A2 abilitato', type: 'checkbox', section: 'Strumenti' },
+            { key: 'hemoscreen_poct1a2_host', label: 'HemoScreen POCT1-A2 — host', type: 'text', section: 'Strumenti' },
+            { key: 'hemoscreen_poct1a2_port', label: 'HemoScreen POCT1-A2 — porta', type: 'number', section: 'Strumenti' },
+            { key: 'hemoscreen_poct1a2_continuous_mode', label: 'HemoScreen modalità continua', type: 'checkbox', section: 'Strumenti' },
+            { key: 'hemoscreen_poct1a2_timeout', label: 'HemoScreen timeout (s)', type: 'number', step: '0.5', section: 'Strumenti' },
+
+            // VPN
+            { key: 'vpn_enabled', label: 'VPN abilitata', type: 'checkbox', section: 'VPN' },
+            { key: 'vpn_provider', label: 'Provider', type: 'select', options: ['external', 'wireguard', 'openvpn'], section: 'VPN' },
+            { key: 'vpn_manage_lifecycle', label: 'Il middleware gestisce avvio/arresto tunnel', type: 'checkbox', section: 'VPN' },
+            { key: 'vpn_interface', label: 'Interfaccia (wg-quick / systemd unit)', type: 'text', section: 'VPN' },
+            { key: 'vpn_config_path', label: 'File config tunnel (WireGuard)', type: 'text', section: 'VPN' },
+            { key: 'vpn_up_command', label: 'Comando custom di avvio', type: 'text', section: 'VPN' },
+            { key: 'vpn_down_command', label: 'Comando custom di arresto', type: 'text', section: 'VPN' },
+            { key: 'vpn_health_check_host', label: 'Health-check — host (vuoto = LIS host)', type: 'text', section: 'VPN' },
+            { key: 'vpn_health_check_port', label: 'Health-check — porta (vuoto = LIS porta)', type: 'number', section: 'VPN' },
+            { key: 'vpn_health_check_timeout', label: 'Health-check — timeout (s)', type: 'number', step: '0.5', section: 'VPN' },
+            { key: 'vpn_wait_seconds', label: 'Attesa raggiungibilità all’avvio (s)', type: 'number', section: 'VPN' },
+            { key: 'vpn_poll_interval', label: 'Intervallo polling (s)', type: 'number', step: '0.1', section: 'VPN' },
+
+            // Servizio
+            { key: 'db_path', label: 'Percorso database', type: 'text', section: 'Servizio' },
+            { key: 'status_enabled', label: 'Status UI abilitata', type: 'checkbox', section: 'Servizio' },
+            { key: 'status_host', label: 'Status UI — host', type: 'text', section: 'Servizio' },
+            { key: 'status_port', label: 'Status UI — porta', type: 'number', section: 'Servizio' },
+            { key: 'api_enabled', label: 'Dashboard REST abilitata', type: 'checkbox', section: 'Servizio' },
+            { key: 'api_host', label: 'Dashboard — host', type: 'text', section: 'Servizio' },
+            { key: 'api_port', label: 'Dashboard — porta', type: 'number', section: 'Servizio' },
+
+            { key: 'log_level', label: 'Log — livello', type: 'select',
+              options: ['DEBUG', 'INFO', 'WARNING', 'ERROR'], section: 'Log' },
+            { key: 'log_file', label: 'Log — file (vuoto = solo console)', type: 'text', section: 'Log' },
+            { key: 'log_max_bytes', label: 'Log — dimensione max file (byte)', type: 'number', section: 'Log' },
+            { key: 'log_backup_count', label: 'Log — quante rotazioni mantenere', type: 'number', section: 'Log' },
+            { key: 'log_console', label: 'Log anche su console', type: 'checkbox', section: 'Log' },
+        ];
+
+        async function openSettings() {
+            const resp = await fetch('/api/config');
+            const data = await resp.json();
+            document.getElementById('settingsPath').textContent = data.config_path;
+            renderSettingsForm(data.config);
+            document.getElementById('settingsModal').classList.add('show');
+        }
+
+        function closeSettings() {
+            document.getElementById('settingsModal').classList.remove('show');
+        }
+
+        function renderSettingsForm(cfg) {
+            const bySection = {};
+            CONFIG_FIELDS.forEach(f => {
+                (bySection[f.section] = bySection[f.section] || []).push(f);
+            });
+            let html = '';
+            for (const section of Object.keys(bySection)) {
+                html += `<h3 class="settings-section">${section}</h3><div class="settings-grid">`;
+                html += bySection[section].map(f => renderSettingsFieldHtml(f, cfg[f.key])).join('');
+                html += '</div>';
+                if (section === 'VPN') {
+                    html += `<div class="settings-actions" style="border-top:none;padding-top:8px;margin-top:8px;">
+                        <button type="button" class="action-button" onclick="checkVpn()">Verifica tunnel</button>
+                        <span id="vpnCheckResult"></span>
+                    </div>
+                    <div class="settings-actions" style="border-top:none;padding-top:0;margin-top:4px;">
+                        <button type="button" class="action-button" onclick="controlVpn('up')">Avvia tunnel</button>
+                        <button type="button" class="action-button danger" onclick="controlVpn('down')">Ferma tunnel</button>
+                        <span id="vpnControlResult"></span>
+                    </div>
+                    <div class="settings-note" style="margin-top:8px;">
+                        "Avvia/Ferma tunnel" agiscono sulla configurazione già <strong>salvata</strong> su
+                        disco (non su modifiche non ancora salvate in questo form) e solo se
+                        "Il middleware gestisce avvio/arresto tunnel" è attivo — altrimenti il tunnel è
+                        gestito esternamente (systemd/appliance) e questi pulsanti restituiscono un errore.
+                    </div>`;
+                }
+            }
+            document.getElementById('settingsForm').innerHTML = html;
+        }
+
+        function renderSettingsFieldHtml(f, value) {
+            if (f.type === 'checkbox') {
+                return `<label class="settings-field checkbox">
+                    <input type="checkbox" data-key="${f.key}" ${value ? 'checked' : ''}> ${f.label}
+                </label>`;
+            }
+            if (f.type === 'select') {
+                const opts = f.options.map(o => `<option value="${o}" ${o === value ? 'selected' : ''}>${o}</option>`).join('');
+                return `<label class="settings-field"><span>${f.label}</span><select data-key="${f.key}">${opts}</select></label>`;
+            }
+            const step = f.step ? ` step="${f.step}"` : '';
+            const v = value === null || value === undefined ? '' : value;
+            return `<label class="settings-field"><span>${f.label}</span><input type="${f.type}" data-key="${f.key}" value="${v}"${step}></label>`;
+        }
+
+        function collectSettingsPayload() {
+            const payload = {};
+            document.querySelectorAll('#settingsForm [data-key]').forEach(el => {
+                const field = CONFIG_FIELDS.find(f => f.key === el.dataset.key);
+                if (field.type === 'checkbox') payload[field.key] = el.checked;
+                else if (field.type === 'number') payload[field.key] = el.value === '' ? 0 : Number(el.value);
+                else payload[field.key] = el.value;
+            });
+            return payload;
+        }
+
+        async function saveSettings() {
+            const payload = collectSettingsPayload();
+            const resp = await fetch('/api/config', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            if (resp.ok) {
+                alert('Configurazione salvata. Riavvia il servizio per applicare le modifiche.');
+                closeSettings();
+            } else {
+                const err = await resp.json().catch(() => ({}));
+                alert('Errore: ' + (err.detail || resp.status));
+            }
+        }
+
+        async function checkVpn() {
+            const val = key => (document.querySelector(`[data-key="${key}"]`) || {}).value || '';
+            // "0" (default numerico di vpn_health_check_port) e' una stringa
+            // non vuota quindi truthy in JS: va trattato come "non impostato",
+            // coerente con la stessa convenzione lato server (run.py).
+            const numOrEmpty = v => (v && v !== '0') ? v : '';
+            const host = val('vpn_health_check_host') || val('lis_host');
+            const port = numOrEmpty(val('vpn_health_check_port')) || val('lis_port');
+            const resultEl = document.getElementById('vpnCheckResult');
+            if (!host || !port) {
+                resultEl.textContent = 'Imposta almeno LIS host/porta o health-check host/porta.';
+                resultEl.style.color = '#f39c12';
+                return;
+            }
+            resultEl.textContent = 'Verifica in corso…';
+            resultEl.style.color = '#666';
+            try {
+                const resp = await fetch(`/api/vpn/check?host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}`);
+                const data = await resp.json();
+                resultEl.textContent = data.reachable
+                    ? `✓ raggiungibile (${host}:${port})`
+                    : `✗ non raggiungibile (${host}:${port})`;
+                resultEl.style.color = data.reachable ? '#27ae60' : '#e74c3c';
+            } catch (e) {
+                resultEl.textContent = 'Errore nella verifica.';
+                resultEl.style.color = '#e74c3c';
+            }
+        }
+
+        async function controlVpn(action) {
+            const label = action === 'up' ? 'avviare' : 'fermare';
+            if (!confirm(`Confermi di voler ${label} il tunnel VPN (configurazione salvata)?`)) return;
+            const resultEl = document.getElementById('vpnControlResult');
+            resultEl.textContent = action === 'up' ? 'Avvio in corso…' : 'Arresto in corso…';
+            resultEl.style.color = '#666';
+            try {
+                const resp = await fetch(`/api/vpn/${action}`, { method: 'POST' });
+                const data = await resp.json().catch(() => ({}));
+                if (resp.ok) {
+                    resultEl.textContent = action === 'up' ? '✓ tunnel avviato' : '✓ tunnel fermato';
+                    resultEl.style.color = '#27ae60';
+                } else {
+                    resultEl.textContent = '✗ ' + (data.detail || `errore ${resp.status}`);
+                    resultEl.style.color = '#e74c3c';
+                }
+            } catch (e) {
+                resultEl.textContent = '✗ errore di rete';
+                resultEl.style.color = '#e74c3c';
+            }
+        }
+
+        async function loadLogs() {
+            const el = document.getElementById('logContent');
+            try {
+                const r = await fetch('/api/logs?lines=200');
+                if (!r.ok) {
+                    const d = await r.json().catch(() => ({}));
+                    el.textContent = `[log non disponibile: ${d.detail || r.status}]`;
+                    return;
+                }
+                el.textContent = (await r.text()) || '[file di log vuoto]';
+                el.scrollTop = el.scrollHeight;
+            } catch (e) {
+                el.textContent = `[errore di rete caricando il log: ${e}]`;
+            }
+        }
+
         // Initial load and auto-refresh
         updateDashboard();
         setInterval(updateDashboard, 5000);
+        loadLogs();
     </script>
 </body>
 </html>"""

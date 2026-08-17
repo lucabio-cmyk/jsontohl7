@@ -19,3 +19,8 @@ config.json
 .DS_Store
 .vscode/
 .idea/
+
+# PyInstaller (build locale dell'eseguibile Windows, vedi packaging/win/)
+build/
+dist/
+*.spec

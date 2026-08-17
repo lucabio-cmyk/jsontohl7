@@ -1,0 +1,39 @@
+# Esempio di configurazione client OpenVPN per il tunnel site-to-site che il
+# LIS del cliente usa oggi per raggiungere Citizen Care Connect (CCHS) —
+# alternativa a WireGuard (vedi wg-cchs.conf.example).
+#
+# Questo middleware SOSTITUISCE CCHS in quello scambio: i valori vanno presi
+# dalla configurazione del tunnel del LIS (non richiesti a CCHS) — vedi
+# INTEGRATION_CITIZENCARE.md §6. Copiare in /etc/openvpn/client/cchs.conf e
+# compilare i valori tra <>. Certificati/chiavi (ca.crt, client.crt,
+# client.key) del lato LIS del tunnel: NON committarli nel repository —
+# vanno tenuti fuori dal controllo versione (permessi 600, root:root), come
+# da CLAUDE.md "niente dati paziente/segreti nei commit".
+#
+# Attivazione manuale:   sudo openvpn --config /etc/openvpn/client/cchs.conf
+# Attivazione al boot:   sudo systemctl enable --now openvpn-client@cchs
+#
+# In config.json del middleware, con tunnel gestito da systemd (consigliato):
+#   "vpn_enabled": true, "vpn_provider": "openvpn", "vpn_interface": "cchs",
+#   "vpn_manage_lifecycle": false,
+#   "lis_host": "<IP del LIS lato tunnel>", "lis_port": <porta ORU del LIS>,
+#   "vpn_health_check_host": "<IP del LIS lato tunnel>",
+#   "vpn_health_check_port": <porta ORU del LIS>  (default: uguale a lis_host/lis_port)
+
+client
+dev tun
+proto udp
+remote <endpoint-del-lis> <1194>
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+
+ca /etc/openvpn/client/cchs-ca.crt
+cert /etc/openvpn/client/cchs-client.crt
+key /etc/openvpn/client/cchs-client.key
+
+remote-cert-tls server
+cipher AES-256-GCM
+auth SHA256
+verb 3

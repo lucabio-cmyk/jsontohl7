@@ -130,6 +130,27 @@ def _patient(segs) -> dict:
     }
 
 
+def parse_adt(message: str) -> dict:
+    """ADT^A0x dal LIS (es. A04 registrazione nuovo paziente) -> dict paziente.
+
+    Alcuni LIS (es. Citizen Care Connect) inviano un ADT^A04 di registrazione
+    paziente prima o insieme all'ORM^O01 dell'ordine vero e proprio. Non produce
+    un ordine: il chiamante decide se e come persistere/riscontrare l'evento
+    (tipicamente un ACK positivo, senza creare una riga in 'orders')."""
+    segs = split_segments(message)
+    mtype = msh_field(segs, 9)
+    if not mtype.startswith("ADT"):
+        raise Hl7Error(f"Tipo messaggio non gestito come ADT: {mtype!r}")
+    evn = find(segs, "EVN")
+    return {
+        "message_control_id": msh_field(segs, 10),
+        "message_type": mtype,
+        "event_type": get(evn or [], 1) or mtype.split(CMP)[-1],
+        "patient": _patient(segs),
+        "raw": message,
+    }
+
+
 def parse_order(message: str) -> dict:
     """ORM^O01 / OML^O21 dal LIS -> dict ordine normalizzato.
     Estrae gli identificativi utili al matching (sample/placer/filler)."""
@@ -193,6 +214,7 @@ def parse_result(message: str) -> dict:
         "specimen_id": specimen, "placer_order_number": placer, "filler_order_number": filler,
         "results": results,
         "result_datetime": get(obr or [], 22) or now_ts(),
+        "sending_application": msh_field(segs, 3),
         "raw": message,
     }
 

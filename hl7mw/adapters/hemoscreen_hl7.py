@@ -20,6 +20,7 @@ import logging
 
 from .. import hl7
 from ..mllp import MllpServer
+from ..monitor import DeviceMonitor
 from ..pipeline import try_complete
 from ..store import Store
 
@@ -215,11 +216,13 @@ class HemoscreenHl7ResultReceiver:
 
     def __init__(self, store: Store, host: str, port: int,
                  sending_app: str = "HL7MW",
-                 sending_facility: str = "MIDDLEWARE"):
+                 sending_facility: str = "MIDDLEWARE",
+                 monitor: DeviceMonitor | None = None):
         self.store = store
         self.host, self.port = host, port
         self.sending_app = sending_app
         self.sending_facility = sending_facility
+        self.monitor = monitor
         self._server: MllpServer | None = None
 
     def _handle(self, message: str) -> str:
@@ -230,23 +233,27 @@ class HemoscreenHl7ResultReceiver:
             return _build_ack_hs(message, "AE", str(e),
                                   self.sending_app, self.sending_facility)
 
+        device_name = result.get("device_serial") or "UNKNOWN"
+        if self.monitor:
+            self.monitor.record_message(device_name)
+
         key = result["sample_key"]
         if not key:
             # Nessun Test Identifier: registra come non abbinato, ACK positivo
-            self.store.add_unmatched(result)
+            self.store.add_unmatched(result, source_instrument=device_name)
             LOG.warning("HemoScreen HL7: risultato senza sample_key -> unmatched")
             return _build_ack_hs(message, "AA", "",
                                   self.sending_app, self.sending_facility)
 
         order = self.store.get_order(key)
         if not order:
-            self.store.add_unmatched(result)
+            self.store.add_unmatched(result, source_instrument=device_name)
             LOG.warning(
                 "HemoScreen HL7: risultato senza ordine (sample=%s, obs_type=%s) -> unmatched",
                 key, result.get("observation_type"),
             )
         else:
-            self.store.add_result(key, result)
+            self.store.add_result(key, result, source_instrument=device_name)
             try_complete(self.store, key)
             LOG.info(
                 "HemoScreen HL7: risultato associato sample=%s obs_type=%s analiti=%d",

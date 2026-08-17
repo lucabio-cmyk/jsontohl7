@@ -12,9 +12,16 @@ dependencies = []   # core a zero dipendenze (solo stdlib)
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+api = ["fastapi>=0.100", "uvicorn>=0.23"]
+build = ["pyinstaller>=6.0", "pyinstaller-hooks-contrib"]
 
 [project.scripts]
 hl7mw = "hl7mw.run:main"
 
 [tool.setuptools]
 packages = ["hl7mw"]
+
+[tool.setuptools.package-data]
+# Chart.js vendorizzato per la dashboard (hl7mw/api.py): niente CDN esterno,
+# vedi hl7mw/static/README.md
+hl7mw = ["static/*.js"]

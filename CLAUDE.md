@@ -11,6 +11,12 @@ stato su SQLite). Mantieni questa proprietà salvo decisione esplicita.
 ## WHAT
 Tre flussi (in `hl7mw/pipeline.py`):
 1. `OrderReceiver` — server MLLP, riceve ORM/OML dal LIS, salva l'ordine, risponde ACK.
+   Riceve anche ADT^A0x (registrazione paziente, es. quando si sostituisce un
+   fornitore cloud come Citizen Care Connect): ACK positivo, nessun ordine
+   creato (vedi `_handle_adt`, `hl7.parse_adt`). Alcuni LIS (es. Dedalus) aprono
+   due connessioni MLLP separate verso l'EMR Bridge, una per ADT e una per ORM,
+   invece di un unico canale: supportato con `adt_listen_port` opzionale in
+   `hl7mw/run.py` (secondo `mllp.MllpServer` che riusa `OrderReceiver._handle`).
 2. `ResultReceiver` — server MLLP, riceve ORU dagli strumenti, **associa** all'ordine.
 3. `Forwarder` — ordini `READY` → ORU^R01 → LIS, gestisce l'ACK.
 
@@ -25,6 +31,13 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
 - Convenzioni: commenti/log in italiano; nomi e docstring chiari; niente librerie esterne
   nel package `hl7mw/` senza prima discuterne (UI e tooling di sviluppo possono usarle).
 - Prima di modificare il parsing HL7, aggiungi un test in `tests/` che riproduce il caso.
+- Logging: ogni modulo usa `LOG = logging.getLogger("hl7mw")` (o logger figli, es.
+  `"hl7mw.xxx"` — propagano allo stesso handler). La configurazione (file rotante + console,
+  livello) è centralizzata in `hl7mw/logging_setup.py:configure_logging()`, chiamata una sola
+  volta in `run.main()`: non richiamare `logging.basicConfig()` altrove. Un'eccezione nel
+  gestore di un messaggio MLLP o in un endpoint API deve sempre finire in log
+  (`LOG.exception`/handler globale in `api.py`) prima di essere trasformata in una risposta di
+  errore al chiamante — mai ingoiata silenziosamente (era un bug reale in `mllp.py`).
 
 ## Nuove Features (v2 — Sistema di Gestione & Monitoring)
 
@@ -43,7 +56,18 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
 - Endpoint `/api/instruments` — status tutti device
 - Endpoint `/api/unmatched` — risultati orfani + `/match` per riconciliazione manuale
 - Endpoint `/api/audit-log` — log tracciabilità (filtri per sample/event)
-- **Dashboard HTML moderna**: Chart.js (doughnut chart status, metriche KPI, tabelle ordini, azioni, device status)
+- Endpoint `/api/config` (GET/PUT) — configurazione completa (LIS/strumenti/VPN/servizio) per
+  la pagina Impostazioni della dashboard; scrive su `config.json`, **non applicata a runtime**
+  (componenti inizializzati all'avvio, serve riavvio) — validazione chiavi/tipi contro
+  `run.DEFAULTS` in `api._validate_config_update`
+- Endpoint `/api/vpn/check` — health-check on-demand host:porta (bottone "Verifica tunnel")
+- Endpoint `/api/vpn/up` / `/api/vpn/down` (POST) — avvia/ferma il tunnel on-demand (wg-quick/openvpn/
+  comando custom, vedi `hl7mw/vpn.py`), solo se `vpn_enabled`+`vpn_manage_lifecycle` nella
+  configurazione **salvata** (non nel form non ancora salvato); 400 esplicito altrimenti
+- Endpoint `/api/logs` — tail (default 200 righe) del log tecnico applicativo su file
+  (`hl7mw/logging_setup.py`), diverso dall'audit_log clinico — 404 se `log_file` non configurato
+- **Dashboard HTML moderna**: Chart.js (doughnut chart status, metriche KPI, tabelle ordini, azioni,
+  device status), pannello "Log Applicativo" (tail del file di log, refresh manuale)
 
 Abilitazione: `"api_enabled": true` in config, oppure `pip install fastapi uvicorn`
 
@@ -61,13 +85,42 @@ python3 -m hl7mw.cli --db hl7mw.db audit-log [--sample-key S] [--event-type X] [
 python3 -m hl7mw.cli --db hl7mw.db instruments     # elenco device
 python3 -m hl7mw.cli --db hl7mw.db stats           # statistiche globali
 python3 -m hl7mw.cli --db hl7mw.db unmatched       # risultati orfani
+python3 -m hl7mw.cli logs [--lines 100]            # log tecnico (non richiede --db)
 ```
 
 ### Device Monitoring (`monitor.py`)
 - **`DeviceMonitor`** integrato nei Receiver: registra heartbeat ad ogni messaggio
-- Aggiorna status ONLINE/OFFLINE basato su timeout (config: `device_offline_timeout_seconds`)
+  (auto-registra lo strumento se nuovo — vedi `record_message`)
+- Aggiorna status ONLINE/OFFLINE basato su timeout (config: `device_offline_timeout_seconds`) —
+  `update_health_status()` richiamato dal loop principale in `run.main()` ad ogni giro
+  (insieme a `forwarder.forward_ready()`), non solo on-demand
 - Traccia msg count per device
-- Audit log per cambio status (INFO online, WARNING offline)
+- Audit log **e** log tecnico per cambio status (INFO online, WARNING offline)
+
+## Sostituzione Citizen Care Connect (CCHS) + VPN
+
+CCHS **non è né il LIS né uno strumento**: è essa stessa un middleware/bridge
+("EMR Bridge Module") verso cui il LIS del cliente è oggi configurato — vedi
+`INTEGRATION_CITIZENCARE.md`. Questo middleware **sostituisce CCHS** in quello
+scambio (es. il fornitore CCHS non è affidabile/disponibile): il LIS non va
+riconfigurato, gli si reindirizza solo la connessione (e il tunnel VPN, se
+presente) che oggi usa per parlare con CCHS. Nessun adapter dedicato: usa
+`OrderReceiver`/`Forwarder` esistenti, con `lis_host`/`lis_port`/
+`order_listen_port` puntati agli endpoint del **vero LIS** (non di CCHS).
+L'unica estensione è il supporto ADT^A0x in `OrderReceiver` (sopra), perché
+CCHS (e quindi il LIS così configurato) lo invia prima dell'ordine. Lo
+strumento fisico (es. HemoScreen) si collega come sempre tramite
+`adapters/hemoscreen_*.py`, indipendentemente da CCHS/LIS.
+
+`hl7mw/vpn.py` — `VpnManager`: health-check sempre (default su `lis_host:lis_port`);
+avvio/arresto del tunnel (wg-quick/openvpn/comando custom) solo se
+`vpn_manage_lifecycle: true`, altrimenti gestito esternamente (systemd —
+consigliato in produzione). Il LIS raggiunge oggi CCHS via un tunnel site-to-site
+che il LIS stesso origina (spec CCHS §5.1): per sostituire CCHS senza toccare
+il LIS, questo middleware deve trovarsi sull'altro capo di quel tunnel (o di uno
+riconfigurato per puntare qui). Solo stdlib (subprocess/socket): niente
+crypto/tunneling reimplementato in Python. Template VPN (WireGuard/OpenVPN) e
+guida setup in `vpn/README.md`.
 
 ## Da fare (priorità)
 1. Adapter **ASTM E1381/E1394** per strumenti non-HL7 → produrre lo stesso dict di
@@ -75,6 +128,9 @@ python3 -m hl7mw.cli --db hl7mw.db unmatched       # risultati orfani
 2. Regola di **completezza** reale in `pipeline.try_complete` (test richiesti vs ricevuti).
 3. **Retry/backoff persistente** nel `Forwarder` (storico retry, DLQ).
 4. **Sicurezza**: TLS sul MLLP, autenticazione API, RBAC dashboard.
+5. Supporto esplicito `ADT^A08` (update paziente, dichiarato da CCHS ma non
+   ancora distinto da A04 in `_handle_adt`, che oggi tratta tutti gli ADT allo
+   stesso modo: ACK positivo, nessuna persistenza).
 
 ## Attenzione (dominio sanitario)
 Dati clinici reali: niente dati paziente nei log/commit, attenzione a sicurezza del

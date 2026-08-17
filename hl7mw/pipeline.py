@@ -34,6 +34,9 @@ class OrderReceiver:
         self._server: mllp.MllpServer | None = None
 
     def _handle(self, message: str) -> str:
+        mtype = hl7.msh_field(hl7.split_segments(message), 9)
+        if mtype.startswith("ADT"):
+            return self._handle_adt(message)
         try:
             order = hl7.parse_order(message)
         except hl7.Hl7Error as e:
@@ -50,6 +53,24 @@ class OrderReceiver:
         try_complete(self.store, order["sample_key"])
         LOG.info("Ordine ricevuto dal LIS: sample=%s test=%s",
                  order["sample_key"], order["universal_service_id"].get("text"))
+        return hl7.build_ack(message, "AA", "", self.sending_app, self.sending_facility)
+
+    def _handle_adt(self, message: str) -> str:
+        """ADT^A0x (es. A04 registrazione paziente): alcuni LIS lo inviano prima
+        dell'ordine vero e proprio (es. Citizen Care Connect, spec CCHS §4.1). Non
+        crea un ordine: l'ORM^O01 che segue porta gia' i dati paziente necessari
+        (vedi hl7.parse_order/_patient). Qui riscontriamo solo con ACK positivo,
+        cosi' il mittente non considera fallita la registrazione."""
+        try:
+            adt = hl7.parse_adt(message)
+        except hl7.Hl7Error as e:
+            LOG.warning("ADT non valido rifiutato: %s", e)
+            return hl7.build_ack(message, "AR", str(e), self.sending_app, self.sending_facility)
+        # Niente identificativi paziente in log/audit (SECURITY_PRIVACY.md: "no PHI
+        # nei technical logs") — solo il tipo di evento, coerente con l'audit degli
+        # ordini (order_received) che logga sample_key ma mai i dati del paziente.
+        self.store.audit_log("patient_registered", details=f"ADT {adt['event_type']}")
+        LOG.info("Registrazione paziente ricevuta dal LIS: evento=%s", adt["event_type"])
         return hl7.build_ack(message, "AA", "", self.sending_app, self.sending_facility)
 
     def start(self):
@@ -83,20 +104,20 @@ class ResultReceiver:
         key = result["sample_key"]
         order = self.store.get_order(key) if key else None
 
-        # Registra heartbeat dello strumento
-        device_name = result.get("sending_application", "UNKNOWN")
+        # Registra heartbeat dello strumento (MSH-3 del messaggio ORU)
+        device_name = result.get("sending_application") or "UNKNOWN"
         if self.monitor:
             self.monitor.record_message(device_name)
 
         if not order:
-            self.store.add_unmatched(result)
+            self.store.add_unmatched(result, source_instrument=device_name)
             self.store.audit_log("result_unmatched", sample_key=key,
                                 instrument=device_name,
                                 details=f"No matching order")
             LOG.warning("Risultato senza ordine corrispondente: sample=%s -> unmatched", key)
             return hl7.build_ack(message, "AA", "", self.sending_app, self.sending_facility)
 
-        self.store.add_result(key, result)
+        self.store.add_result(key, result, source_instrument=device_name)
         timing = self.store.get_timing(key)
         if not timing or not timing.get("first_result_at"):
             self.store.record_timing(key, "first_result")

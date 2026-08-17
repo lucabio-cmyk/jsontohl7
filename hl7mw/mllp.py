@@ -8,11 +8,14 @@ Framing: <0x0B> messaggio <0x1C><0x0D>.  Solo stdlib.
 """
 from __future__ import annotations
 
+import logging
 import socket
 import socketserver
 import threading
 from dataclasses import dataclass
 from typing import Callable
+
+LOG = logging.getLogger("hl7mw")
 
 SB, EB, CR = b"\x0b", b"\x1c", b"\x0d"
 
@@ -59,12 +62,14 @@ def read_frame(sock: socket.socket, timeout: float) -> bytes:
 # --------------------------------------------------------------------------- client
 def exchange(host: str, port: int, message: str,
              connect_timeout: float = 10.0, read_timeout: float = 30.0) -> str:
+    LOG.debug("MLLP: invio a %s:%s (%d byte)", host, port, len(message))
     try:
         with socket.create_connection((host, port), timeout=connect_timeout) as s:
             s.settimeout(read_timeout)
             s.sendall(frame(message))
             return read_frame(s, read_timeout).decode("utf-8", errors="replace")
     except (OSError, socket.timeout) as e:
+        LOG.debug("MLLP: scambio con %s:%s fallito: %s", host, port, e)
         raise MllpError(f"Connessione a {host}:{port} fallita: {e}") from e
 
 
@@ -119,16 +124,33 @@ class MllpServer:
 
         class _H(socketserver.BaseRequestHandler):
             def handle(self):
-                raw = read_frame(self.request, outer.read_timeout)
+                try:
+                    raw = read_frame(self.request, outer.read_timeout)
+                except MllpError as e:
+                    LOG.debug("MLLP %s:%s: %s (client=%s)", outer.host, outer.port, e, self.client_address)
+                    return
                 if not raw:
                     return
                 message = raw.decode("utf-8", errors="replace")
                 try:
                     reply = outer.handler(message)
-                except Exception as e:  # il server non deve cadere: rispondi AE
+                except Exception:
+                    # Il server non deve cadere per un bug nel gestore: risponde AE,
+                    # ma l'eccezione (stack trace incluso) va sempre in log — altrimenti
+                    # il mittente vede solo un ACK rifiutato, senza nessuna traccia di
+                    # cosa sia realmente andato storto lato middleware.
+                    LOG.exception(
+                        "MLLP %s:%s: errore nel gestore del messaggio (client=%s)",
+                        outer.host, outer.port, self.client_address,
+                    )
                     from . import hl7
-                    reply = hl7.build_ack(message, "AE", f"handler error: {e}")
-                self.request.sendall(frame(reply))
+                    reply = hl7.build_ack(message, "AE", "Errore interno del middleware "
+                                          "(vedi log applicativo per il dettaglio)")
+                try:
+                    self.request.sendall(frame(reply))
+                except OSError as e:
+                    LOG.warning("MLLP %s:%s: invio risposta fallito (client=%s): %s",
+                               outer.host, outer.port, self.client_address, e)
 
         class _Srv(socketserver.ThreadingTCPServer):
             allow_reuse_address = True

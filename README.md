@@ -22,38 +22,190 @@ hl7mw/
   mllp.py        trasporto MLLP: client + server
   store.py       persistenza SQLite + ciclo di vita + query per la UI
   pipeline.py    OrderReceiver, ResultReceiver, Forwarder, regola di associazione
-  webstatus.py   endpoint di stato di sola lettura (aggancio UI)
-  run.py         runner del servizio
-tests/test_e2e.py  test end-to-end del loop completo (senza pytest)
+  monitor.py     DeviceMonitor: heartbeat/status strumenti (ONLINE/OFFLINE), audit log
+  webstatus.py   endpoint di stato di sola lettura, minimale (senza dipendenze)
+  api.py         REST API + dashboard HTML (FastAPI, opzionale)
+  cli.py         CLI operativa (ordini, retry, cancel, audit, stats)
+  adapters/      adapter per strumenti non-HL7 standard (es. HemoScreen)
+  vpn.py         gestione opzionale del tunnel VPN verso il LIS (es. sostituzione Citizen Care Connect)
+  run.py         runner del servizio (avvia tutti i componenti sopra)
+tests/           test end-to-end e di unità (senza pytest, eseguibili singolarmente)
+vpn/             template di configurazione VPN (WireGuard/OpenVPN) + guida setup
 config.example.json
-ARCHITECTURE.md  · CLAUDE.md (contesto per Claude Code)
+config.dedalus-cchs.example.json   esempio concreto: LIS Dedalus in sostituzione di CCHS (vedi INTEGRATION_CITIZENCARE.md §9)
+ARCHITECTURE.md  · CLAUDE.md (contesto per Claude Code) · INTEGRATION_CITIZENCARE.md
 ```
 
 ## Avvio
 
 ```bash
 cp config.example.json config.json     # adatta host/porte del LIS
+pip install -e ".[api]"                # opzionale: abilita REST API + dashboard
 python3 -m hl7mw.run -c config.json
-# Order in:   :6661 (MLLP, dal LIS)
-# Result in:  :6662 (MLLP, dagli strumenti)
-# Stato UI:   http://127.0.0.1:8080
+# Order in:      :6661 (MLLP, dal LIS)
+# Result in:     :6662 (MLLP, dagli strumenti)
+# Stato UI:      http://127.0.0.1:8080  (sempre attivo, sola lettura, zero dipendenze)
+# API/Dashboard: http://127.0.0.1:8000  (se "api_enabled": true e fastapi/uvicorn installati)
 ```
+
+Il core (`hl7mw/`) resta a **zero dipendenze esterne**: se FastAPI/uvicorn non sono
+installati, il servizio parte comunque — l'API viene semplicemente disabilitata con un
+warning nei log, e restano attivi ordini/risultati/inoltro + Stato UI minimale.
+
+## Configurazione da GUI
+
+La dashboard (`http://host:8000/`) ha un pulsante **⚙ Impostazioni** che apre un
+form per l'intera configurazione — LIS, strumenti (HemoScreen), VPN, rete/servizio
+— con validazione (chiavi/tipi), un pulsante **Verifica tunnel** che testa la
+raggiungibilità VPN in tempo reale (`GET /api/vpn/check`) senza dover salvare
+prima, e — se `vpn_manage_lifecycle: true` — **Avvia tunnel**/**Ferma tunnel**
+per avviarlo/fermarlo on-demand (`POST /api/vpn/up`/`/down`, agiscono sulla
+configurazione già salvata, non sul form). Il salvataggio scrive su
+`config.json` (`GET`/`PUT /api/config`): **non è applicato a runtime** — LIS,
+VPN e adapter strumenti sono inizializzati una sola volta all'avvio, quindi
+serve riavviare il servizio perché le modifiche abbiano effetto (la dashboard
+lo segnala esplicitamente dopo il salvataggio).
+
+## Eseguibile Windows (.exe)
+
+Per far girare il middleware su una macchina Windows senza Python installato:
+build automatica via GitHub Actions (workflow
+[`build-windows-exe.yml`](.github/workflows/build-windows-exe.yml)), che
+compila un `.exe` standalone (core + dashboard REST) con PyInstaller su un
+runner Windows reale.
+
+1. Dalla scheda **Actions** del repo → *Build Windows exe* → **Run workflow**.
+2. A fine build (qualche minuto), scaricare l'artifact `hl7mw-middleware-windows`
+   (contiene `hl7mw-middleware.exe` + `config.example.json`).
+3. Sulla macchina Windows: rinominare `config.example.json` in `config.json`,
+   adattare host/porte del LIS, poi:
+   ```powershell
+   .\hl7mw-middleware.exe -c config.json
+   ```
+   (avviabile anche senza `-c`: usa i default in `hl7mw/run.py` → `DEFAULTS`).
+
+Per una build locale (es. su una macchina Windows con Python già installato):
+```powershell
+pip install -e ".[build,api]"
+pyinstaller --onefile --name hl7mw-middleware packaging/win/hl7mw_entry.py
+```
+
+## CLI operativa
+
+```bash
+python3 -m hl7mw.cli --db hl7mw.db orders [--status READY|ERROR|SENT]
+python3 -m hl7mw.cli --db hl7mw.db order <sample_key>
+python3 -m hl7mw.cli --db hl7mw.db retry <sample_key>      # ERROR -> READY
+python3 -m hl7mw.cli --db hl7mw.db cancel <sample_key>
+python3 -m hl7mw.cli --db hl7mw.db audit-log [--sample-key S] [--event-type X]
+python3 -m hl7mw.cli --db hl7mw.db instruments
+python3 -m hl7mw.cli --db hl7mw.db stats
+python3 -m hl7mw.cli --db hl7mw.db unmatched
+python3 -m hl7mw.cli logs [--lines 100] [--log-file path]   # non richiede --db
+```
+
+## Logging
+
+Due tracciati distinti, entrambi sempre attivi:
+
+- **Audit log clinico** (`audit_log` su SQLite): eventi strutturati per la tracciabilità
+  (ordine ricevuto/pronto/inoltrato, cambio stato strumento, direttive HemoScreen, modifiche
+  config/VPN) — `GET /api/audit-log`, `python3 -m hl7mw.cli audit-log`.
+- **Log tecnico applicativo** (`hl7mw/logging_setup.py`): l'intero servizio (MLLP, DB, VPN, API
+  — incluse le eccezioni con stack trace, anche quelle di FastAPI/uvicorn, unificate nello stesso
+  flusso) su **file con rotazione** + console, per diagnosticare un problema senza doverlo
+  riprodurre. Configurabile (`log_level`/`log_file`/`log_max_bytes`/`log_backup_count`/
+  `log_console` in `config.json`, anche dalla GUI Impostazioni → sezione Log); `log_file: ""`
+  disabilita il file e logga solo su console. Consultabile senza accesso SSH/shell:
+  `GET /api/logs?lines=200` (pannello "Log Applicativo" in dashboard) o
+  `python3 -m hl7mw.cli logs`.
+
+Un bug nel gestore di un messaggio MLLP (LIS/strumento) non fa più cadere il servizio né
+sparisce silenziosamente: risponde un ACK di errore generico al mittente e logga l'eccezione
+completa (stack trace) sul file — prima veniva ingoiata senza lasciare traccia.
+
+## Sostituzione di Citizen Care Connect (CCHS) + VPN
+
+**CCHS non è né il LIS né uno strumento: è essa stessa un middleware/bridge
+("EMR Bridge Module") che il vero LIS del cliente raggiunge oggi.** Questo
+middleware può **prendere il posto di CCHS** in quello scambio — il LIS non
+richiede nessuna modifica, basta reindirizzargli la connessione (e il tunnel
+VPN, se presente) che oggi usa per parlare con CCHS verso qui. Usa esattamente
+`OrderReceiver` (ora con supporto `ADT^A04` di registrazione paziente, oltre a
+`ORM^O01`) e `Forwarder`, invariati — nessun adapter dedicato necessario:
+
+```bash
+# config.json — lis_host/lis_port/receiving_app sono il VERO LIS, non CCHS
+"order_listen_port": 6661,                       # il vero LIS si connette qui (oggi punta a CCHS)
+"lis_host": "10.9.0.10", "lis_port": 2576,        # dove il vero LIS riceve l'ORU (endpoint gia' noto)
+"receiving_app": "LIS", "receiving_facility": "OSP",
+
+"vpn_enabled": true, "vpn_manage_lifecycle": false            # tunnel gestito da systemd
+```
+
+Lo strumento fisico (es. HemoScreen) si collega come sempre tramite gli
+adapter esistenti (`hemoscreen_hl7_enabled`/`hemoscreen_poct1a2_enabled`),
+indipendentemente da CCHS/LIS.
+
+Guida completa (ruoli, dati da raccogliere per la sostituzione, config
+WireGuard/OpenVPN, systemd, firewall, validazione) in
+**`INTEGRATION_CITIZENCARE.md`** e **`vpn/README.md`**.
+
+## Gestione HemoScreen (POCT1-A2)
+
+Oltre alla ricezione risultati (OBS.R01 sangue, OBS.R02 QC/EQA — vedi
+`hl7mw/adapters/hemoscreen_poct1a2.py`), l'adapter POCT1-A2 implementa l'intero
+profilo HS-IL-00067 Rev.06 previsto per l'Observation Reviewer: richiesta
+osservazioni/eventi pendenti (REQ.R01 ROBS/RDEV), modalità continua
+(DTV.R01 START_CONTINUOUS, con gestione del rifiuto via ESC.R01), risposta
+alle richieste paziente del device in modalità continua (REQ.R01 RPAT →
+PTL.R01) ed eventi strumento persistiti su audit log (EVS.R01). `DTV.PIX.FW`
+(firmware) non è implementato: la spec lo dichiara "draft e non rilasciato".
+
+Il device è sempre l'iniziatore della connessione TCP: le direttive verso lo
+strumento (lock/unlock, ora, liste operatori, lotti QC, range di normalità
+per genere, setup) non si "inviano" a un indirizzo ma si **accodano** nella
+conversazione attiva e vengono recapitate al primo punto protocollarmente
+sicuro — via REST API (stesso processo del middleware in esecuzione):
+
+```bash
+GET  /api/hemoscreen/devices                              # device_id/serial connessi ora
+POST /api/hemoscreen/{device_id}/lock
+POST /api/hemoscreen/{device_id}/unlock
+POST /api/hemoscreen/{device_id}/set-time                 # body opzionale {"dttm": "2026-01-01T10:00:00+01:00"}
+POST /api/hemoscreen/{device_id}/operator-list             # {"operators": [{"operator_id","permission_level_cd"}]}
+POST /api/hemoscreen/{device_id}/operator-list-incremental  # {"updates": [{"action_cd":"D"|"I","operators":[...]}]}
+POST /api/hemoscreen/{device_id}/qc-lot                    # {"lot_number","expiration_date","revision","levels":{"H"|"N"|"L":[...]}}
+POST /api/hemoscreen/{device_id}/gender-normal-range        # {"effective_date","genders":{"M"|"F":[...]}}
+POST /api/hemoscreen/{device_id}/device-setup               # struttura DTV.PIX.DVCSET, vedi build_dtv_pix_dvcset()
+```
+
+`404` se nessun device con quell'identificativo è connesso in questo momento
+a questo processo. Ogni direttiva accodata è tracciata su audit log.
 
 ## Test
 
 ```bash
-python3 tests/test_e2e.py
-# [1] ordine ricevuto  [2] risultato associato  [3] inoltro al LIS  [4] orfano -> unmatched
+python3 tests/test_e2e.py               # loop completo ordine -> risultato -> inoltro
+python3 tests/test_management_system.py # API/store v2: dashboard, retry, audit, instruments
+python3 tests/test_ack_retry_backoff.py # retry/backoff su ACK del LIS
+python3 tests/test_hemoscreen.py        # adapter strumento HemoScreen (HL7 e POCT1-A2)
+python3 tests/test_citizencare.py       # sostituzione CCHS: ADT^A04 + ORM^O01 -> ORU^R01 verso il vero LIS + modulo VPN
+python3 tests/test_config_api.py        # pagina Impostazioni: GET/PUT /api/config, avvio/arresto/verifica VPN
 ```
 
 ## Stato attuale e prossimi passi
 
-Funzionante e testato: ricezione ordini, ricezione/associazione risultati, inoltro al LIS
-con ACK (inclusi retry automatici su errori transitori), gestione risultati orfani,
-dashboard di stato di sola lettura.
+Funzionante e testato: ricezione ordini (ORM/OML + ADT^A0x di registrazione
+paziente), ricezione/associazione risultati, inoltro al LIS con ACK (inclusi
+retry automatici su errori transitori), gestione risultati orfani, device
+monitoring con heartbeat/status, audit log clinico, REST API + dashboard web
+(Chart.js) con pagina Impostazioni per l'intera configurazione (LIS, strumenti,
+VPN) e verifica tunnel in tempo reale, CLI operativa completa, VPN configurabile
+per sostituire fornitori cloud come Citizen Care Connect (CCHS) senza toccare
+il LIS del cliente.
 
-Da sviluppare (vedi `ARCHITECTURE.md` → Roadmap): adapter **ASTM** per gli strumenti che
-non parlano HL7, regola di completezza basata sui test richiesti, retry/backoff persistente
-con policy avanzata (es. exponential backoff e limite giornaliero),
-nell'inoltro, e la **UI completa** (coda ordini, dettaglio, riassociazione orfani, azioni
-retry/forza-inoltro) sopra `store.py`.
+Da sviluppare (vedi `ARCHITECTURE.md` → Roadmap e `CLAUDE.md` → "Da fare"): adapter
+**ASTM E1381/E1394** per strumenti non-HL7 generici, regola di completezza reale basata
+sui test richiesti vs ricevuti, retry/backoff persistente con storico e DLQ, sicurezza
+(TLS sul MLLP, autenticazione API, RBAC dashboard).
