@@ -214,6 +214,7 @@ def parse_result(message: str) -> dict:
         "specimen_id": specimen, "placer_order_number": placer, "filler_order_number": filler,
         "results": results,
         "result_datetime": get(obr or [], 22) or now_ts(),
+        "sending_application": msh_field(segs, 3),
         "raw": message,
     }
 

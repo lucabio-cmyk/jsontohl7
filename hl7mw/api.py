@@ -355,6 +355,7 @@ def get_dashboard_html() -> str:
         .badge.unknown { background: #e2e3e5; color: #383d41; }
         .badge.received { background: #cfe2ff; color: #084298; }
         .badge.ready { background: #cff4fc; color: #055160; }
+        .badge.forwarding { background: #e2d9f3; color: #432874; }
         .badge.sent { background: #d4edda; color: #155724; }
         .badge.error { background: #f8d7da; color: #721c24; }
 
@@ -503,6 +504,7 @@ def get_dashboard_html() -> str:
                 const instrResp = await fetch('/api/instruments');
                 const instruments = await instrResp.json();
                 renderInstruments(instruments);
+                try { renderInstrumentChart(instruments); } catch (e) { console.error('Grafico strumenti non disponibile:', e); }
 
                 // Orders
                 const ordersResp = await fetch('/api/orders?limit=20');
@@ -549,11 +551,38 @@ def get_dashboard_html() -> str:
             });
         }
 
+        function renderInstrumentChart(instruments) {
+            const ctx = document.getElementById('instrumentChart').getContext('2d');
+            if (instrumentChart) instrumentChart.destroy();
+
+            const colors = { ONLINE: '#27ae60', OFFLINE: '#e74c3c', UNKNOWN: '#95a5a6' };
+            const counts = {};
+            instruments.forEach(i => {
+                const s = (i.status || 'UNKNOWN').toUpperCase();
+                counts[s] = (counts[s] || 0) + 1;
+            });
+            const labels = Object.keys(counts);
+
+            instrumentChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: labels.map(l => counts[l]),
+                        backgroundColor: labels.map(l => colors[l] || '#3498db'),
+                        borderColor: 'white',
+                        borderWidth: 2,
+                    }],
+                },
+                options: { responsive: true, maintainAspectRatio: false },
+            });
+        }
+
         function renderInstruments(instruments) {
             document.getElementById('instruments').innerHTML = instruments.map(i =>
                 `<div class="instrument-card">
                     <div class="name">${i.name}</div>
-                    <div class="info"><strong>Host:</strong> ${i.host}:${i.port}</div>
+                    ${i.host ? `<div class="info"><strong>Host:</strong> ${i.host}${i.port ? ':' + i.port : ''}</div>` : ''}
                     <div class="info"><strong>Tipo:</strong> ${i.type}</div>
                     <div class="info"><strong>Status:</strong> <span class="badge ${i.status.toLowerCase()}">${i.status}</span></div>
                     <div class="info"><strong>Ultimi messaggi:</strong> ${i.last_message_at || 'mai'}</div>

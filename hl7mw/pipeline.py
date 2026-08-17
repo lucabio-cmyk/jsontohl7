@@ -102,8 +102,8 @@ class ResultReceiver:
         key = result["sample_key"]
         order = self.store.get_order(key) if key else None
 
-        # Registra heartbeat dello strumento
-        device_name = result.get("sending_application", "UNKNOWN")
+        # Registra heartbeat dello strumento (MSH-3 del messaggio ORU)
+        device_name = result.get("sending_application") or "UNKNOWN"
         if self.monitor:
             self.monitor.record_message(device_name)
 
