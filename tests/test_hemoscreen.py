@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hl7mw import hl7, mllp
+from hl7mw.monitor import DeviceMonitor
 from hl7mw.store import Store
 from hl7mw.adapters.hemoscreen_hl7 import (
     parse_hemoscreen_hl7,
@@ -610,6 +611,45 @@ def test_poct1a2_unmatched():
         rx.stop()
 
 
+def test_poct1a2_single_instrument_row_no_duplicate():
+    """Bug corretto: l'heartbeat del primo messaggio (HEL.R01) veniva registrato
+    PRIMA di estrarre il serial dal device, quindi finiva sotto il nome fallback
+    (indirizzo IP:porta); i messaggi successivi della stessa connessione
+    usavano invece il serial_id -> due righe 'instruments' per lo stesso device
+    fisico. Ora l'heartbeat e' registrato dopo lo smistamento del messaggio,
+    quindi anche il primo usa gia' il serial_id risolto da HEL.R01."""
+    store = Store("/tmp/hl7mw_test_hs_dup.db")
+    Path("/tmp/hl7mw_test_hs_dup.db").unlink(missing_ok=True)
+    store = Store("/tmp/hl7mw_test_hs_dup.db")
+    monitor = DeviceMonitor(store)
+
+    rx = HemoscreenPoct1A2Receiver(store, "127.0.0.1", 0, continuous_mode=False,
+                                   timeout=5.0, monitor=monitor)
+    rx.start()
+    srv_port = rx._srv.server_address[1]
+
+    try:
+        with socket.create_connection(("127.0.0.1", srv_port), timeout=5.0) as s:
+            s.settimeout(5.0)
+            _mllp_send(s, _build_hel("1"))      # DEV.serial_id="0001-HS" (vedi _build_hel)
+            _mllp_recv(s, 5.0)                  # ACK HEL: primo heartbeat di questa connessione
+            _mllp_send(s, _build_dst("2", new_obs=0))
+            _mllp_recv(s, 5.0)                  # ACK DST
+            raw_end = _mllp_recv(s, 5.0)        # nessuna osservazione pendente -> END.R01 diretto
+            end_ctrl = ET.fromstring(raw_end.decode()).find(".//HDR.control_id").get("V", "")
+            _mllp_send(s, _device_ack("3", end_ctrl))
+
+        time.sleep(0.2)
+        instruments = store.get_instruments()
+        assert len(instruments) == 1, \
+            f"attesa una sola riga strumento, ottenute {len(instruments)}: {[i['name'] for i in instruments]}"
+        assert instruments[0]["name"] == "0001-HS", \
+            f"il nome deve essere il serial_id risolto da HEL.R01, non un fallback: {instruments[0]['name']!r}"
+        print("[10] POCT1-A2: heartbeat del primo messaggio (HEL.R01) non crea una riga strumento duplicata  OK")
+    finally:
+        rx.stop()
+
+
 # ---------------------------------------------------------------------------
 # Test POCT1-A2: builder delle direttive (roundtrip XML)
 # ---------------------------------------------------------------------------
@@ -688,7 +728,7 @@ def test_poct1a2_directive_builders():
     assert root.find(".//UNIT.wbc5part_cd").get("V") == "10*3/uL"
     assert root.find(".//PRMDIS.wbc_cd").get("V") == "SHOW"
 
-    print("[10] Builder direttive POCT1-A2 (SET_TIME/OPL/PTL/QC/FB/DVCSET): struttura XML OK")
+    print("[11] Builder direttive POCT1-A2 (SET_TIME/OPL/PTL/QC/FB/DVCSET): struttura XML OK")
 
 
 # ---------------------------------------------------------------------------
@@ -761,7 +801,7 @@ def test_poct1a2_esc_and_rdev():
             "EVS.R01 deve essere persistito su audit_log"
         assert any(a["event_type"] == "poct1a2_escape" for a in audit), \
             "ESC.R01 deve essere persistito su audit_log"
-        print("[11] ESC.R01 senza risposta, REQ.R01(RDEV) su soli eventi, EVS.R01 su audit_log  OK")
+        print("[12] ESC.R01 senza risposta, REQ.R01(RDEV) su soli eventi, EVS.R01 su audit_log  OK")
     finally:
         rx.stop()
 
@@ -853,7 +893,7 @@ def test_poct1a2_continuous_rpat_and_directives():
             _mllp_send(s, _device_ack("10", lock_ctrl))
 
         time.sleep(0.2)
-        print("[12] Modalita' continua: START_CONTINUOUS, REQ.R01(RPAT)->PTL.R01, "
+        print("[13] Modalita' continua: START_CONTINUOUS, REQ.R01(RPAT)->PTL.R01, "
               "direttiva LOCK accodata da fuori la conversazione  OK")
     finally:
         rx.stop()
@@ -894,7 +934,7 @@ def test_poct1a2_continuous_rejected():
         time.sleep(0.2)
         audit = store.get_audit_log(limit=20)
         assert any(a["event_type"] == "poct1a2_escape" for a in audit)
-        print("[13] Rifiuto modalita' continua (ESC.R01 su START_CONTINUOUS) gestito "
+        print("[14] Rifiuto modalita' continua (ESC.R01 su START_CONTINUOUS) gestito "
               "senza bloccare la conversazione  OK")
     finally:
         rx.stop()
@@ -916,6 +956,7 @@ def main():
         test_parse_obs_r02,
         test_poct1a2_conversation,
         test_poct1a2_unmatched,
+        test_poct1a2_single_instrument_row_no_duplicate,
         test_poct1a2_directive_builders,
         test_poct1a2_esc_and_rdev,
         test_poct1a2_continuous_rpat_and_directives,

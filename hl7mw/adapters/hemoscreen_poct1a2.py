@@ -719,12 +719,6 @@ class _Conversation:
                 if msg_type == "PARSE_ERROR" or root is None:
                     continue
 
-                if self._monitor:
-                    self._monitor.record_message(
-                        self._device_id or self._fallback_name,
-                        self._addr[0], self._addr[1], "POCT1-A2",
-                    )
-
                 ctrl_id = _attr(root.find(".//HDR.control_id"))
 
                 # ---- HEL.R01 ------------------------------------------------
@@ -897,6 +891,18 @@ class _Conversation:
                                 self._addr, msg_type)
                     self._send(_xml_ack(self._next_ctrl(), ctrl_id, type_cd="AE",
                                        note=f"Messaggio non supportato: {msg_type}"))
+
+                # Dopo lo smistamento: se questo messaggio era HEL.R01, self._device_id
+                # e' gia' risolto dal serial/device_id del device, cosi' l'heartbeat
+                # (incluso il primo, per questa stessa connessione) usa sempre la
+                # stessa identita' — registrarlo prima dello smistamento creava due
+                # righe strumento distinte (una "fallback" per l'HEL.R01, una per
+                # serial_id da qui in poi) per lo stesso device fisico.
+                if self._monitor:
+                    self._monitor.record_message(
+                        self._device_id or self._fallback_name,
+                        self._addr[0], self._addr[1], "POCT1-A2",
+                    )
 
                 self._drain_directives()
 
