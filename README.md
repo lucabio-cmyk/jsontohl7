@@ -51,6 +51,30 @@ Il core (`hl7mw/`) resta a **zero dipendenze esterne**: se FastAPI/uvicorn non s
 installati, il servizio parte comunque — l'API viene semplicemente disabilitata con un
 warning nei log, e restano attivi ordini/risultati/inoltro + Stato UI minimale.
 
+## Eseguibile Windows (.exe)
+
+Per far girare il middleware su una macchina Windows senza Python installato:
+build automatica via GitHub Actions (workflow
+[`build-windows-exe.yml`](.github/workflows/build-windows-exe.yml)), che
+compila un `.exe` standalone (core + dashboard REST) con PyInstaller su un
+runner Windows reale.
+
+1. Dalla scheda **Actions** del repo → *Build Windows exe* → **Run workflow**.
+2. A fine build (qualche minuto), scaricare l'artifact `hl7mw-middleware-windows`
+   (contiene `hl7mw-middleware.exe` + `config.example.json`).
+3. Sulla macchina Windows: rinominare `config.example.json` in `config.json`,
+   adattare host/porte del LIS, poi:
+   ```powershell
+   .\hl7mw-middleware.exe -c config.json
+   ```
+   (avviabile anche senza `-c`: usa i default in `hl7mw/run.py` → `DEFAULTS`).
+
+Per una build locale (es. su una macchina Windows con Python già installato):
+```powershell
+pip install -e ".[build,api]"
+pyinstaller --onefile --name hl7mw-middleware packaging/win/hl7mw_entry.py
+```
+
 ## CLI operativa
 
 ```bash

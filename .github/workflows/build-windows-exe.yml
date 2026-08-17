@@ -1,0 +1,39 @@
+name: Build Windows exe
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[api]"
+          pip install pyinstaller pyinstaller-hooks-contrib
+
+      - name: Build eseguibile
+        run: |
+          pyinstaller --onefile --name hl7mw-middleware --clean packaging/win/hl7mw_entry.py
+
+      - name: Smoke test (avvio + --help)
+        run: |
+          .\dist\hl7mw-middleware.exe --help
+
+      - name: Copia config di esempio nel pacchetto
+        run: Copy-Item config.example.json dist\config.example.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hl7mw-middleware-windows
+          path: |
+            dist/hl7mw-middleware.exe
+            dist/config.example.json
+          retention-days: 30

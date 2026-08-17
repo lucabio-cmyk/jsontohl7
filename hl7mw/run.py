@@ -138,6 +138,12 @@ def main(argv=None) -> int:
                 port=cfg.get("api_port", 8000),
                 log_level="info",
                 access_log=False,
+                # Espliciti (non "auto"): "auto" risolve l'implementazione via
+                # importlib a runtime, invisibile all'analisi statica di PyInstaller
+                # nell'eseguibile Windows (vedi packaging/win/). h11/asyncio sono
+                # puro Python, portabili senza compilazione; niente websocket:
+                # la dashboard usa solo HTTP/JSON.
+                loop="asyncio", http="h11", ws="none", lifespan="on",
             )
 
         api_thread = threading.Thread(target=run_api, daemon=True)
