@@ -114,7 +114,6 @@ def main(argv=None) -> int:
                 port=cfg.get("api_port", 8000),
                 log_level="info",
                 access_log=False,
-                install_signal_handlers=False,
             )
 
         api_thread = threading.Thread(target=run_api, daemon=True)
