@@ -156,6 +156,57 @@ def cmd_unmatched(args, store: Store):
     return 0
 
 
+def cmd_messages(args, store: Store):
+    """Traffico HL7: header + esito del riscontro di ogni messaggio scambiato."""
+    rows = store.get_messages(limit=args.limit, direction=args.direction,
+                              channel=args.channel, sample_key=args.sample_key,
+                              control_id=args.control_id, only_errors=args.errors)
+    print(f"Messaggi ({len(rows)}, dal piu' recente):")
+    print(f"  {'QUANDO':19} {'DIR':3} {'CANALE':10} {'TIPO':12} {'CONTROL ID':22} "
+          f"{'SAMPLE':20} {'ACK':4} {'ERR':6} MS")
+    for m in rows:
+        print(f"  {m['timestamp']:19} {m['direction']:3} {(m['channel'] or '-'):10} "
+              f"{(m['message_type'] or '-'):12} {(m['control_id'] or '-'):22} "
+              f"{(m['sample_key'] or '-'):20} {(m['ack_code'] or '-'):4} "
+              f"{(m['error_code'] or '-'):6} {m['elapsed_ms'] if m['elapsed_ms'] is not None else '-'}"
+              + ("  [dup]" if m["duplicate"] else ""))
+    return 0
+
+
+def cmd_message_stats(args, store: Store):
+    """Riepilogo del traffico HL7 e dei riscontri."""
+    s = store.message_stats()
+    print("Traffico HL7:")
+    print(f"  Messaggi totali: {s['total']}")
+    for direction, n in sorted(s["by_direction"].items()):
+        print(f"    {direction}: {n}")
+    print(f"  NACK (AE/AR/CE/CR): {s['nacks']}")
+    print(f"  Ritrasmissioni riscontrate senza rielaborazione: {s['duplicates']}")
+    print(f"  Ultimo messaggio: {s['last_message_at'] or '-'}")
+    if s["by_ack_code"]:
+        print("  Per codice ACK:")
+        for code, n in sorted(s["by_ack_code"].items()):
+            print(f"    {code}: {n}")
+    if s["by_message_type"]:
+        print("  Per tipo messaggio:")
+        for mtype, n in s["by_message_type"].items():
+            print(f"    {mtype}: {n}")
+    return 0
+
+
+def cmd_duplicates(args, store: Store):
+    """Control id visti piu' di una volta dallo stesso mittente: ritrasmissioni
+    (contenuto identico, ACK ripetuto) o riuso improprio dell'identificativo
+    (contenuto diverso, messaggio elaborato — vedi audit_log)."""
+    rows = store.duplicate_messages(args.limit)
+    print(f"Control id ripetuti: {len(rows)}")
+    for r in rows:
+        print(f"  {(r['sending_app'] or '-'):15} {r['control_id']:22} "
+              f"{(r['message_type'] or '-'):12} {(r['sample_key'] or '-'):20} "
+              f"x{r['hits']} (primo {r['first_seen']}, ultimo {r['last_seen'] or '-'})")
+    return 0
+
+
 def cmd_logs(args):
     """Ultime righe del log applicativo (file rotante, diverso dall'audit-log
     clinico su DB): non richiede il database, cosi' resta utilizzabile anche
@@ -232,6 +283,25 @@ def main():
     # unmatched
     p_unmatched = subparsers.add_parser("unmatched", help="Risultati orfani")
     p_unmatched.set_defaults(func=cmd_unmatched)
+
+    # messages
+    p_msgs = subparsers.add_parser("messages", help="Traffico HL7 con esito dei riscontri")
+    p_msgs.add_argument("--direction", choices=["IN", "OUT"], help="Solo ricevuti o solo inviati")
+    p_msgs.add_argument("--channel", help="Filtra per canale (orders, results, forward, ...)")
+    p_msgs.add_argument("--sample-key", help="Filtra per sample key")
+    p_msgs.add_argument("--control-id", help="Filtra per MSH-10")
+    p_msgs.add_argument("--errors", action="store_true", help="Solo NACK (AE/AR/CE/CR)")
+    p_msgs.add_argument("--limit", type=int, default=50, help="Limite risultati (default 50)")
+    p_msgs.set_defaults(func=cmd_messages)
+
+    # message-stats
+    p_mstats = subparsers.add_parser("message-stats", help="Riepilogo traffico HL7 e riscontri")
+    p_mstats.set_defaults(func=cmd_message_stats)
+
+    # duplicates
+    p_dup = subparsers.add_parser("duplicates", help="Control id ripetuti (ritrasmissioni o riuso di MSH-10)")
+    p_dup.add_argument("--limit", type=int, default=50, help="Limite risultati (default 50)")
+    p_dup.set_defaults(func=cmd_duplicates)
 
     # logs
     p_logs = subparsers.add_parser("logs", help="Ultime righe del log applicativo (tecnico, non l'audit clinico)")

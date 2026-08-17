@@ -84,7 +84,45 @@ CREATE TABLE IF NOT EXISTS order_timing (
     sent_at TEXT,
     FOREIGN KEY(sample_key) REFERENCES orders(sample_key)
 );
+CREATE TABLE IF NOT EXISTS message_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    direction TEXT NOT NULL,           -- IN (ricevuto) | OUT (inviato da noi)
+    channel TEXT,                      -- orders | adt | results | forward | <adapter>
+    peer TEXT,                         -- host:porta del corrispondente
+    sending_app TEXT,
+    sending_facility TEXT,
+    receiving_app TEXT,
+    message_type TEXT,
+    control_id TEXT,
+    version TEXT,
+    processing_id TEXT,
+    sample_key TEXT,
+    ack_code TEXT,
+    ack_text TEXT,
+    error_code TEXT,
+    ack_mode TEXT,                     -- original | enhanced
+    duplicate INTEGER DEFAULT 0,
+    elapsed_ms REAL
+);
+CREATE TABLE IF NOT EXISTS processed_messages (
+    sending_app TEXT NOT NULL,
+    control_id TEXT NOT NULL,
+    message_type TEXT,
+    sample_key TEXT,
+    ack_code TEXT,
+    ack_raw TEXT,
+    payload_hash TEXT,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT,
+    hits INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (sending_app, control_id)
+);
 CREATE INDEX IF NOT EXISTS idx_results_sample ON results(sample_key);
+CREATE INDEX IF NOT EXISTS idx_msglog_timestamp ON message_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_msglog_control ON message_log(control_id);
+CREATE INDEX IF NOT EXISTS idx_msglog_sample ON message_log(sample_key);
+CREATE INDEX IF NOT EXISTS idx_processed_seen ON processed_messages(first_seen);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
@@ -260,6 +298,138 @@ class Store:
         with self._conn() as c:
             return [dict(r) for r in c.execute(
                 "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?", (limit,))]
+
+    # ----- traffico HL7 (message log) -----
+    # Traccia di ogni messaggio scambiato: serve a rispondere in campo alla
+    # domanda "il messaggio e' arrivato? come l'abbiamo riscontrato?" senza
+    # spulciare il log tecnico. Volutamente NIENTE payload: solo metadati di
+    # header e ACK (nessun dato paziente, vedi SECURITY_PRIVACY.md).
+    def log_message(self, direction: str, channel: str = "", peer: str = "",
+                    sending_app: str = "", sending_facility: str = "",
+                    receiving_app: str = "", message_type: str = "",
+                    control_id: str = "", version: str = "", processing_id: str = "",
+                    sample_key: str | None = None, ack_code: str = "",
+                    ack_text: str = "", error_code: str = "", ack_mode: str = "",
+                    duplicate: bool = False, elapsed_ms: float | None = None) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO message_log(timestamp, direction, channel, peer, sending_app,
+                       sending_facility, receiving_app, message_type, control_id, version,
+                       processing_id, sample_key, ack_code, ack_text, error_code, ack_mode,
+                       duplicate, elapsed_ms)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (_now(), direction, channel, peer, sending_app, sending_facility,
+                 receiving_app, message_type, control_id, version, processing_id,
+                 sample_key, ack_code, ack_text, error_code, ack_mode,
+                 1 if duplicate else 0, elapsed_ms),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_messages(self, limit: int = 200, direction: str | None = None,
+                     channel: str | None = None, sample_key: str | None = None,
+                     control_id: str | None = None,
+                     only_errors: bool = False) -> list[dict]:
+        sql = "SELECT * FROM message_log WHERE 1=1"
+        params: list = []
+        if direction:
+            sql += " AND direction=?"; params.append(direction)
+        if channel:
+            sql += " AND channel=?"; params.append(channel)
+        if sample_key:
+            sql += " AND sample_key=?"; params.append(sample_key)
+        if control_id:
+            sql += " AND control_id=?"; params.append(control_id)
+        if only_errors:
+            sql += " AND ack_code NOT IN ('AA','CA','')"
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(sql, params)]
+
+    def message_stats(self) -> dict:
+        """Riepilogo del traffico HL7 per la dashboard."""
+        with self._conn() as c:
+            by_direction = {r["direction"]: r["n"] for r in c.execute(
+                "SELECT direction, COUNT(*) n FROM message_log GROUP BY direction")}
+            by_ack = {(r["ack_code"] or "-"): r["n"] for r in c.execute(
+                "SELECT ack_code, COUNT(*) n FROM message_log GROUP BY ack_code")}
+            by_type = {(r["message_type"] or "-"): r["n"] for r in c.execute(
+                "SELECT message_type, COUNT(*) n FROM message_log GROUP BY message_type "
+                "ORDER BY n DESC LIMIT 20")}
+            duplicates = c.execute(
+                "SELECT COUNT(*) n FROM message_log WHERE duplicate=1").fetchone()["n"]
+            nacks = c.execute(
+                "SELECT COUNT(*) n FROM message_log WHERE ack_code IN ('AE','AR','CE','CR')"
+            ).fetchone()["n"]
+            total = sum(by_direction.values())
+            last = c.execute(
+                "SELECT timestamp FROM message_log ORDER BY id DESC LIMIT 1").fetchone()
+        return {
+            "total": total, "by_direction": by_direction, "by_ack_code": by_ack,
+            "by_message_type": by_type, "duplicates": duplicates, "nacks": nacks,
+            "last_message_at": last["timestamp"] if last else None,
+        }
+
+    # ----- idempotenza (deduplica per MSH-10) -----
+    # HL7 non garantisce l'unicita' della consegna: se il nostro ACK si perde, un
+    # mittente conforme ritrasmette lo stesso messaggio con lo stesso MSH-10. Senza
+    # questo controllo il risultato verrebbe inserito due volte.
+    def find_processed(self, sending_app: str, control_id: str) -> dict | None:
+        if not control_id:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM processed_messages WHERE sending_app=? AND control_id=?",
+                (sending_app or "", control_id)).fetchone()
+            return dict(row) if row else None
+
+    def remember_processed(self, sending_app: str, control_id: str,
+                           message_type: str = "", sample_key: str | None = None,
+                           ack_code: str = "", ack_raw: str = "",
+                           payload_hash: str = "") -> None:
+        """Registra il messaggio come elaborato (o aggiorna la riga se lo stesso
+        control id viene riusato con un contenuto diverso)."""
+        if not control_id:
+            return
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO processed_messages(sending_app, control_id, message_type,
+                       sample_key, ack_code, ack_raw, payload_hash, first_seen, last_seen, hits)
+                   VALUES(?,?,?,?,?,?,?,?,?,1)
+                   ON CONFLICT(sending_app, control_id) DO UPDATE SET
+                       hits=hits+1, last_seen=excluded.last_seen,
+                       message_type=excluded.message_type,
+                       sample_key=excluded.sample_key,
+                       ack_code=excluded.ack_code,
+                       ack_raw=excluded.ack_raw,
+                       payload_hash=excluded.payload_hash""",
+                (sending_app or "", control_id, message_type, sample_key,
+                 ack_code, ack_raw, payload_hash, _now(), _now()),
+            )
+
+    def bump_processed(self, sending_app: str, control_id: str) -> None:
+        """Conta una ritrasmissione senza toccare il riscontro memorizzato."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE processed_messages SET hits=hits+1, last_seen=? "
+                "WHERE sending_app=? AND control_id=?",
+                (_now(), sending_app or "", control_id),
+            )
+
+    def purge_processed(self, older_than_hours: float = 72.0) -> int:
+        """Sfoltisce la tabella di deduplica: oltre la finestra di ritrasmissione
+        plausibile i control id non servono piu'."""
+        cutoff = (_dt.datetime.now() - _dt.timedelta(hours=older_than_hours)).isoformat(
+            timespec="seconds")
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM processed_messages WHERE first_seen < ?", (cutoff,))
+            return cur.rowcount or 0
+
+    def duplicate_messages(self, limit: int = 100) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM processed_messages WHERE hits > 1 ORDER BY last_seen DESC LIMIT ?",
+                (limit,))]
 
     # ----- timing & stats -----
     def record_timing(self, sample_key: str, event: str) -> None:

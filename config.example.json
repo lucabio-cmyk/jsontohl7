@@ -28,6 +28,18 @@
   "ack_retry_attempts": 2,
   "ack_retry_backoff_seconds": 0.5,
 
+  "_comment_hl7_ack": "Riscontro HL7 (capitolo 2.9 dello standard). hl7_ack_mode: 'auto' onora MSH-15/MSH-16 se il mittente li valorizza (enhanced mode: commit ACK CA + ACK applicativo AA, due risposte sulla stessa connessione), altrimenti risponde con un solo ACK come sempre; 'original' li ignora, 'enhanced' li impone. order_response_mode: 'ack' (ACK^O01^ACK) oppure 'order' (ORR^O02 per ORM, ORL^O22 per OML) per i LIS che si aspettano la risposta applicativa d'ordine. lis_ack_mode: cosa chiediamo al LIS per l'ORU in uscita ('enhanced' => l'ordine passa a SENT solo dopo l'ACK applicativo). hl7_dedup_*: una ritrasmissione con lo stesso MSH-10 e stesso contenuto riceve di nuovo lo stesso ACK senza essere rielaborata.",
+
+  "hl7_ack_mode": "auto",
+  "hl7_ack_include_err": true,
+  "order_response_mode": "ack",
+  "lis_ack_mode": "original",
+  "lis_application_ack_timeout": 0,
+  "hl7_dedup_enabled": true,
+  "hl7_dedup_retention_hours": 72.0,
+  "mllp_read_timeout": 60.0,
+  "mllp_idle_timeout": 300.0,
+
   "status_enabled": true,
   "status_host": "127.0.0.1",
   "status_port": 8080,
