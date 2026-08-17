@@ -7,7 +7,7 @@
   "result_listen_host": "0.0.0.0",
   "result_listen_port": 6662,
 
-  "_comment_lis": "Il LIS e' Citizen Care Connect (CCHS): ci invia ADT^A04+ORM^O01 su order_listen_port, noi gli inoltriamo l'ORU^R01 su lis_host/lis_port. Vedi INTEGRATION_CITIZENCARE.md.",
+  "_comment_lis": "lis_host/lis_port e order_listen_port sono gli endpoint del VERO LIS del cliente (ci invia ADT^A04+ORM^O01 su order_listen_port, noi gli inoltriamo l'ORU^R01 su lis_host/lis_port). Se questo middleware sostituisce un fornitore cloud come Citizen Care Connect (CCHS), sono gli stessi endpoint che il LIS ha gia' configurati per CCHS: vedi INTEGRATION_CITIZENCARE.md.",
 
   "lis_host": "10.8.0.10",
   "lis_port": 2575,
@@ -42,7 +42,7 @@
   "hemoscreen_poct1a2_continuous_mode": false,
   "hemoscreen_poct1a2_timeout": 65.0,
 
-  "_comment_vpn": "Tunnel VPN site-to-site verso il LIS (CCHS lo richiede per il loro Cloud Ingest Server). Con vpn_manage_lifecycle=false (consigliato) il middleware fa solo l'health-check su vpn_health_check_host/port (default: lis_host/lis_port); il tunnel va portato su a livello di sistema (vedi vpn/README.md).",
+  "_comment_vpn": "Tunnel VPN site-to-site verso il LIS. Se si sostituisce un fornitore cloud come CCHS, e' lo stesso tunnel che il LIS origina gia' verso di loro (spec CCHS SS5.1), ripuntato qui. Con vpn_manage_lifecycle=false (consigliato) il middleware fa solo l'health-check su vpn_health_check_host/port (default: lis_host/lis_port); il tunnel va portato su a livello di sistema (vedi vpn/README.md).",
 
   "vpn_enabled": false,
   "vpn_provider": "wireguard",

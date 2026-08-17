@@ -1,33 +1,38 @@
-# Esempio di configurazione WireGuard per il tunnel site-to-site verso
-# Citizen Care Connect (CCHS), richiesto dalla loro spec §5.1 ("secure
-# communication with the CCHS Cloud Ingest Server through a site-to-site
-# VPN tunnel originating from the host location of the LIS/EMR").
+# Esempio di configurazione WireGuard per il tunnel site-to-site che il LIS
+# del cliente usa oggi per raggiungere Citizen Care Connect (CCHS) — spec
+# CCHS §5.1 ("secure communication with the CCHS Cloud Ingest Server through
+# a site-to-site VPN tunnel originating from the host location of the LIS/EMR").
+#
+# Questo middleware SOSTITUISCE CCHS in quello scambio: questo lato del tunnel
+# va configurato per corrispondere a ciò che il LIS ha già impostato come
+# "lato CCHS" del suo tunnel (o un tunnel nuovo, se lo si ricrea da zero),
+# non richiesto a CCHS — vedi INTEGRATION_CITIZENCARE.md §6.
 #
 # Copiare in /etc/wireguard/wg-cchs.conf (permessi 600, root:root) e
-# compilare i valori tra <> con quelli forniti da CCHS in fase di onboarding
-# (support@citizencarehealth.com).
+# compilare i valori tra <> con i dati del tunnel del LIS.
 #
 # Attivazione manuale:   sudo wg-quick up wg-cchs
 # Attivazione al boot:   sudo systemctl enable --now wg-quick@wg-cchs
 #
 # In config.json del middleware, con tunnel gestito da systemd (consigliato):
 #   "vpn_enabled": true, "vpn_manage_lifecycle": false,
-#   "lis_host": "<IP interno CCHS lato tunnel>", "lis_port": <porta ORU CCHS>,
-#   "vpn_health_check_host": "<IP interno CCHS lato tunnel>",
-#   "vpn_health_check_port": <porta ORU CCHS>  (default: uguale a lis_host/lis_port)
+#   "lis_host": "<IP del LIS lato tunnel>", "lis_port": <porta ORU del LIS>,
+#   "vpn_health_check_host": "<IP del LIS lato tunnel>",
+#   "vpn_health_check_port": <porta ORU del LIS>  (default: uguale a lis_host/lis_port)
 
 [Interface]
-# Chiave privata di QUESTO host (generare con: wg genkey | tee wg-cchs.key | wg pubkey > wg-cchs.pub)
+# Chiave privata di QUESTO host, cioe' del middleware che sostituisce CCHS
+# (generare con: wg genkey | tee wg-cchs.key | wg pubkey > wg-cchs.pub)
 PrivateKey = <la-tua-chiave-privata>
-# IP assegnato a questo lato del tunnel (fornito da CCHS)
+# IP assegnato a questo lato del tunnel (quello gia' usato/atteso per CCHS)
 Address = <10.x.x.x/30>
 
 [Peer]
-# Chiave pubblica fornita da Citizen Care Health Solutions
-PublicKey = <chiave-pubblica-CCHS>
-# Endpoint pubblico del gateway VPN CCHS (host:porta forniti in onboarding)
-Endpoint = <vpn.citizencarehealth.com:51820>
-# Instrada verso il tunnel solo la rete/gli host CCHS concordati (non 0.0.0.0/0:
-# il tunnel serve solo per raggiungere il Cloud Ingest Server, non come default gateway)
+# Chiave pubblica del LIS (o dell'appliance/gateway di rete del cliente)
+PublicKey = <chiave-pubblica-del-LIS>
+# Endpoint pubblico da cui il LIS avvia il tunnel
+Endpoint = <endpoint-del-lis:51820>
+# Instrada verso il tunnel solo la rete/gli host concordati con il LIS (non
+# 0.0.0.0/0: il tunnel serve solo per questo traffico HL7, non come default gateway)
 AllowedIPs = <10.9.0.0/24>
 PersistentKeepalive = 25

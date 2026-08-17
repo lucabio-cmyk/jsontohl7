@@ -1,16 +1,22 @@
 """
-Test dell'integrazione con Citizen Care Connect (CCHS) come LIS, e del modulo VPN.
+Test della sostituzione di Citizen Care Connect (CCHS), e del modulo VPN.
 
-CCHS è il LIS: invia ADT^A04 (registrazione paziente) e ORM^O01 (ordine) al
-middleware (OrderReceiver, invariato salvo il supporto ADT^A04 aggiunto), e
-riceve l'ORU^R01 di risposta (Forwarder, invariato). Nessun componente dedicato:
-questo test verifica solo l'estensione ADT^A04 e il modulo VPN.
+CCHS non è né il LIS né uno strumento: è essa stessa un middleware/bridge
+verso cui il vero LIS del cliente è oggi configurato (vedi
+INTEGRATION_CITIZENCARE.md). Questo middleware ne prende il posto: riceve
+ADT^A04 (registrazione paziente) e ORM^O01 (ordine) dal vero LIS
+(OrderReceiver, invariato salvo il supporto ADT^A04 aggiunto), e gli
+restituisce l'ORU^R01 (Forwarder, invariato) — esattamente il ruolo di "CCHS
+Application" nella tabella di validazione §5.2 della loro spec. Nessun
+componente dedicato: questo test verifica solo l'estensione ADT^A04 e il
+modulo VPN.
 
 Simula:
-  - CCHS che invia ADT^A04 (paziente) poi ORM^O01 (ordine) al middleware
+  - il vero LIS che invia ADT^A04 (paziente) poi ORM^O01 (ordine) al middleware
+    (nella spec CCHS, MSH-3/4 di questi messaggi identificano il LIS mittente,
+    non CCHS: CCHS è sempre il destinatario nei loro esempi — qui MSH-5/6)
   - uno strumento (es. HemoScreen) che invia il risultato
-  - il middleware che inoltra l'ORU^R01 completo a CCHS (come farebbe verso
-    qualunque LIS)
+  - il middleware che inoltra l'ORU^R01 completo al LIS (al posto di CCHS)
 
 Eseguibile senza pytest: `python3 tests/test_citizencare.py`
 """
@@ -28,17 +34,18 @@ from hl7mw.pipeline import OrderReceiver, ResultReceiver, Forwarder
 
 CR = "\r"
 
-# Adattato dal sample ADT_A04 della spec CCHS §4.1 (campi ridotti all'essenziale)
+# Struttura adattata dal sample ADT_A04 della spec CCHS §4.1: MSH-3/4 = identita'
+# del vero LIS mittente, MSH-5/6 = identita' di questo middleware (al posto di CCHS)
 ADT_A04 = CR.join([
-    r"MSH|^~\&|CCHS|CITIZENCARE|HL7MW|MIDDLEWARE|20260817120000||ADT^A04|645511|P|2.5",
+    r"MSH|^~\&|LIS|OSP|HL7MW|MIDDLEWARE|20260817120000||ADT^A04|645511|P|2.5",
     "EVN|A04|20260817120000",
     "PID|1||PATCC01||VERDI^LUCA||19750303|M",
     "PV1|1|O",
 ]) + CR
 
-# Adattato dal sample ORM_O01 della spec CCHS §4.2
+# Struttura adattata dal sample ORM_O01 della spec CCHS §4.2 (stessa identita' MSH)
 ORM = CR.join([
-    r"MSH|^~\&|CCHS|CITIZENCARE|HL7MW|MIDDLEWARE|20260817120010||ORM^O01|645512|P|2.5",
+    r"MSH|^~\&|LIS|OSP|HL7MW|MIDDLEWARE|20260817120010||ORM^O01|645512|P|2.5",
     "PID|1||PATCC01||VERDI^LUCA||19750303|M",
     "ORC|NW|PLACCC01|FILLCC01||||||20260817120010",
     "OBR|1|PLACCC01|FILLCC01|CBC^Complete Blood Count^L",
@@ -53,10 +60,10 @@ ORU_INSTR = CR.join([
 
 
 def _fake_lis(received: list):
-    """Finto CCHS lato LIS: registra l'ORU ricevuto e risponde ACK AA."""
+    """Finto LIS reale (quello che oggi parla con CCHS): registra l'ORU ricevuto e risponde ACK AA."""
     def handler(message):
         received.append(message)
-        return hl7.build_ack(message, "AA", "", "CCHS", "CITIZENCARE")
+        return hl7.build_ack(message, "AA", "", "LIS", "OSP")
     return mllp.MllpServer("127.0.0.1", 0, handler)
 
 
@@ -74,7 +81,7 @@ def test_parse_adt():
         pass
 
 
-def test_full_flow_cchs_as_lis():
+def test_full_flow_replacing_cchs():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = Store(str(Path(tmpdir) / "test.db"))
 
@@ -91,21 +98,21 @@ def test_full_flow_cchs_as_lis():
         lp = lis._srv.server_address[1]
 
         try:
-            # 1) CCHS registra il paziente (ADT^A04): ACK positivo, nessun ordine creato
+            # 1) il LIS registra il paziente (ADT^A04): ACK positivo, nessun ordine creato
             code = mllp.send_message("127.0.0.1", op, ADT_A04)
             assert code == "AA", "ADT^A04 non ACKato"
             assert store.get_order("FILLCC01") is None, "l'ADT non deve creare un ordine"
 
             audit = store.get_audit_log(limit=10)
             assert any(a["event_type"] == "patient_registered" for a in audit)
-            print("[1] OrderReceiver: ADT^A04 (CCHS) accettato, ACK AA, nessun ordine creato  OK")
+            print("[1] OrderReceiver: ADT^A04 dal LIS accettato, ACK AA, nessun ordine creato  OK")
 
-            # 2) CCHS crea l'ordine (ORM^O01)
+            # 2) il LIS crea l'ordine (ORM^O01)
             code = mllp.send_message("127.0.0.1", op, ORM)
             assert code == "AA", "ORM^O01 non ACKato"
             order = store.get_order("FILLCC01")
             assert order and order["status"] == "RECEIVED"
-            print("[2] OrderReceiver: ORM^O01 (CCHS) accettato -> status=RECEIVED  OK")
+            print("[2] OrderReceiver: ORM^O01 dal LIS accettato -> status=RECEIVED  OK")
 
             # 3) lo strumento (es. HemoScreen) invia il risultato
             code = mllp.send_message("127.0.0.1", rp, ORU_INSTR)
@@ -114,15 +121,15 @@ def test_full_flow_cchs_as_lis():
             assert order["status"] == "READY", f"atteso READY, ottenuto {order['status']}"
             print("[3] ResultReceiver: risultato strumento associato -> status=READY  OK")
 
-            # 4) il middleware inoltra l'ORU completo a CCHS (come a qualunque LIS)
+            # 4) il middleware inoltra l'ORU completo al LIS, al posto di CCHS
             fwd = Forwarder(store, "127.0.0.1", lp)
             counts = fwd.forward_ready()
-            assert counts["sent"] == 1, f"inoltro a CCHS fallito: {counts}"
+            assert counts["sent"] == 1, f"inoltro al LIS fallito: {counts}"
             assert store.get_order("FILLCC01")["status"] == "SENT"
             assert len(received) == 1
             parsed = hl7.parse_result(received[0])
             assert len(parsed["results"]) == 2
-            print("[4] Forwarder: ORU^R01 inoltrato a CCHS (LIS) -> status=SENT  OK")
+            print("[4] Forwarder: ORU^R01 inoltrato al LIS (al posto di CCHS) -> status=SENT  OK")
         finally:
             order_rx._server.stop()
             result_rx._server.stop()
@@ -203,7 +210,7 @@ def test_vpn_from_config_disabled():
 
 if __name__ == "__main__":
     test_parse_adt()
-    test_full_flow_cchs_as_lis()
+    test_full_flow_replacing_cchs()
     test_order_receiver_still_rejects_unknown_types()
     test_vpn_health_check()
     test_vpn_from_config_disabled()

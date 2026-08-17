@@ -11,8 +11,9 @@ stato su SQLite). Mantieni questa proprietà salvo decisione esplicita.
 ## WHAT
 Tre flussi (in `hl7mw/pipeline.py`):
 1. `OrderReceiver` — server MLLP, riceve ORM/OML dal LIS, salva l'ordine, risponde ACK.
-   Riceve anche ADT^A0x (registrazione paziente, es. Citizen Care Connect): ACK
-   positivo, nessun ordine creato (vedi `_handle_adt`, `hl7.parse_adt`).
+   Riceve anche ADT^A0x (registrazione paziente, es. quando si sostituisce un
+   fornitore cloud come Citizen Care Connect): ACK positivo, nessun ordine
+   creato (vedi `_handle_adt`, `hl7.parse_adt`).
 2. `ResultReceiver` — server MLLP, riceve ORU dagli strumenti, **associa** all'ordine.
 3. `Forwarder` — ordini `READY` → ORU^R01 → LIS, gestisce l'ACK.
 
@@ -72,21 +73,30 @@ python3 -m hl7mw.cli --db hl7mw.db unmatched       # risultati orfani
 - Traccia msg count per device
 - Audit log per cambio status (INFO online, WARNING offline)
 
-## LIS Citizen Care Connect (CCHS) + VPN
+## Sostituzione Citizen Care Connect (CCHS) + VPN
 
-CCHS è **un LIS**, non uno strumento (il loro documento HL7 spec è indirizzato
-a chi sviluppa il connettore lato LIS/EMR — vedi `INTEGRATION_CITIZENCARE.md`).
-Nessun adapter dedicato: usa `OrderReceiver`/`Forwarder` esistenti, con
-`lis_host`/`lis_port` puntati a CCHS. L'unica estensione è il supporto ADT^A0x
-in `OrderReceiver` (sopra). Lo strumento fisico (es. HemoScreen) si collega
-come sempre tramite `adapters/hemoscreen_*.py`, indipendentemente da CCHS.
+CCHS **non è né il LIS né uno strumento**: è essa stessa un middleware/bridge
+("EMR Bridge Module") verso cui il LIS del cliente è oggi configurato — vedi
+`INTEGRATION_CITIZENCARE.md`. Questo middleware **sostituisce CCHS** in quello
+scambio (es. il fornitore CCHS non è affidabile/disponibile): il LIS non va
+riconfigurato, gli si reindirizza solo la connessione (e il tunnel VPN, se
+presente) che oggi usa per parlare con CCHS. Nessun adapter dedicato: usa
+`OrderReceiver`/`Forwarder` esistenti, con `lis_host`/`lis_port`/
+`order_listen_port` puntati agli endpoint del **vero LIS** (non di CCHS).
+L'unica estensione è il supporto ADT^A0x in `OrderReceiver` (sopra), perché
+CCHS (e quindi il LIS così configurato) lo invia prima dell'ordine. Lo
+strumento fisico (es. HemoScreen) si collega come sempre tramite
+`adapters/hemoscreen_*.py`, indipendentemente da CCHS/LIS.
 
 `hl7mw/vpn.py` — `VpnManager`: health-check sempre (default su `lis_host:lis_port`);
 avvio/arresto del tunnel (wg-quick/openvpn/comando custom) solo se
 `vpn_manage_lifecycle: true`, altrimenti gestito esternamente (systemd —
-consigliato in produzione, richiesto da CCHS per il loro Cloud Ingest Server).
-Solo stdlib (subprocess/socket): niente crypto/tunneling reimplementato in Python.
-Template VPN (WireGuard/OpenVPN) e guida setup in `vpn/README.md`.
+consigliato in produzione). Il LIS raggiunge oggi CCHS via un tunnel site-to-site
+che il LIS stesso origina (spec CCHS §5.1): per sostituire CCHS senza toccare
+il LIS, questo middleware deve trovarsi sull'altro capo di quel tunnel (o di uno
+riconfigurato per puntare qui). Solo stdlib (subprocess/socket): niente
+crypto/tunneling reimplementato in Python. Template VPN (WireGuard/OpenVPN) e
+guida setup in `vpn/README.md`.
 
 ## Da fare (priorità)
 1. Adapter **ASTM E1381/E1394** per strumenti non-HL7 → produrre lo stesso dict di

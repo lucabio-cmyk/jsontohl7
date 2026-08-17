@@ -27,7 +27,7 @@ hl7mw/
   api.py         REST API + dashboard HTML (FastAPI, opzionale)
   cli.py         CLI operativa (ordini, retry, cancel, audit, stats)
   adapters/      adapter per strumenti non-HL7 standard (es. HemoScreen)
-  vpn.py         gestione opzionale del tunnel VPN verso il LIS (es. Citizen Care Connect)
+  vpn.py         gestione opzionale del tunnel VPN verso il LIS (es. sostituzione Citizen Care Connect)
   run.py         runner del servizio (avvia tutti i componenti sopra)
 tests/           test end-to-end e di unità (senza pytest, eseguibili singolarmente)
 vpn/             template di configurazione VPN (WireGuard/OpenVPN) + guida setup
@@ -88,29 +88,32 @@ python3 -m hl7mw.cli --db hl7mw.db stats
 python3 -m hl7mw.cli --db hl7mw.db unmatched
 ```
 
-## LIS Citizen Care Connect (CCHS) + VPN
+## Sostituzione di Citizen Care Connect (CCHS) + VPN
 
-**CCHS è il LIS** (non uno strumento): usa esattamente `OrderReceiver`
-(ora con supporto `ADT^A04` di registrazione paziente, oltre a `ORM^O01`) e
-`Forwarder`, invariati — nessun adapter dedicato necessario. Basta puntare
-`lis_host`/`lis_port` a CCHS e abilitare la VPN richiesta dalla loro spec:
+**CCHS non è né il LIS né uno strumento: è essa stessa un middleware/bridge
+("EMR Bridge Module") che il vero LIS del cliente raggiunge oggi.** Questo
+middleware può **prendere il posto di CCHS** in quello scambio — il LIS non
+richiede nessuna modifica, basta reindirizzargli la connessione (e il tunnel
+VPN, se presente) che oggi usa per parlare con CCHS verso qui. Usa esattamente
+`OrderReceiver` (ora con supporto `ADT^A04` di registrazione paziente, oltre a
+`ORM^O01`) e `Forwarder`, invariati — nessun adapter dedicato necessario:
 
 ```bash
-# config.json
-"order_listen_port": 6661,                                   # CCHS si connette qui per ADT/ORM
-"lis_host": "10.9.0.10", "lis_port": 2576,                    # dove CCHS riceve l'ORU (da onboarding)
-"receiving_app": "CCHS", "receiving_facility": "CITIZENCARE",
+# config.json — lis_host/lis_port/receiving_app sono il VERO LIS, non CCHS
+"order_listen_port": 6661,                       # il vero LIS si connette qui (oggi punta a CCHS)
+"lis_host": "10.9.0.10", "lis_port": 2576,        # dove il vero LIS riceve l'ORU (endpoint gia' noto)
+"receiving_app": "LIS", "receiving_facility": "OSP",
 
 "vpn_enabled": true, "vpn_manage_lifecycle": false            # tunnel gestito da systemd
 ```
 
 Lo strumento fisico (es. HemoScreen) si collega come sempre tramite gli
 adapter esistenti (`hemoscreen_hl7_enabled`/`hemoscreen_poct1a2_enabled`),
-indipendentemente da CCHS.
+indipendentemente da CCHS/LIS.
 
-Guida completa (ruoli, richiesta dati onboarding, config WireGuard/OpenVPN,
-systemd, firewall, validazione) in **`INTEGRATION_CITIZENCARE.md`** e
-**`vpn/README.md`**.
+Guida completa (ruoli, dati da raccogliere per la sostituzione, config
+WireGuard/OpenVPN, systemd, firewall, validazione) in
+**`INTEGRATION_CITIZENCARE.md`** e **`vpn/README.md`**.
 
 ## Test
 
@@ -119,7 +122,7 @@ python3 tests/test_e2e.py               # loop completo ordine -> risultato -> i
 python3 tests/test_management_system.py # API/store v2: dashboard, retry, audit, instruments
 python3 tests/test_ack_retry_backoff.py # retry/backoff su ACK del LIS
 python3 tests/test_hemoscreen.py        # adapter strumento HemoScreen (HL7 e POCT1-A2)
-python3 tests/test_citizencare.py       # CCHS come LIS (ADT^A04 + ORM^O01 -> ORU^R01) + modulo VPN
+python3 tests/test_citizencare.py       # sostituzione CCHS: ADT^A04 + ORM^O01 -> ORU^R01 verso il vero LIS + modulo VPN
 ```
 
 ## Stato attuale e prossimi passi
@@ -128,8 +131,8 @@ Funzionante e testato: ricezione ordini (ORM/OML + ADT^A0x di registrazione
 paziente), ricezione/associazione risultati, inoltro al LIS con ACK (inclusi
 retry automatici su errori transitori), gestione risultati orfani, device
 monitoring con heartbeat/status, audit log clinico, REST API + dashboard web
-(Chart.js), CLI operativa completa, VPN configurabile per LIS che la richiedono
-(es. Citizen Care Connect).
+(Chart.js), CLI operativa completa, VPN configurabile per sostituire fornitori
+cloud come Citizen Care Connect (CCHS) senza toccare il LIS del cliente.
 
 Da sviluppare (vedi `ARCHITECTURE.md` → Roadmap e `CLAUDE.md` → "Da fare"): adapter
 **ASTM E1381/E1394** per strumenti non-HL7 generici, regola di completezza reale basata
