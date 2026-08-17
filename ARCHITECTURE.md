@@ -40,6 +40,8 @@ Tre flussi:
 | `store.py`        | persistenza SQLite: ordini, risultati, orfani, ciclo di vita, query UI |
 | `pipeline.py`     | `OrderReceiver`, `ResultReceiver`, `Forwarder` + regola di associazione |
 | `webstatus.py`    | endpoint di stato di sola lettura (aggancio per la UI)                 |
+| `adapters/citizencare.py` | `CitizenCareForwarder`/`CitizenCareResultReceiver`: fornitore esterno CCHS come "strumento" via VPN (vedi `INTEGRATION_CITIZENCARE.md`) |
+| `vpn.py`          | avvio/verifica opzionale del tunnel VPN verso fornitori esterni       |
 | `run.py`          | runner del servizio: avvia i receiver + loop del forwarder            |
 
 ## Associazione (matching)
@@ -80,7 +82,12 @@ in `ERROR` con `last_error`.
 - Ordini dal LIS: server MLLP su `order_listen_port` (default 6661).
 - Risultati dagli strumenti: server MLLP su `result_listen_port` (default 6662).
 - Inoltro al LIS: client MLLP verso `lis_host:lis_port`.
-- La VPN/connettività è a carico del SO; il middleware si limita a usare gli endpoint.
+- La VPN/connettività è a carico del SO; il middleware si limita a usare gli endpoint
+  (vedi `vpn.py`: health-check sempre, avvio/arresto del tunnel solo se
+  `vpn_manage_lifecycle: true`, altrimenti gestito da systemd/appliance esterna).
+- Fornitore esterno CCHS: ADT/ORM in uscita verso `citizencare_host:citizencare_port`,
+  ORU in ingresso su `citizencare_result_listen_port` — entrambi tipicamente dentro
+  il tunnel VPN. Vedi `INTEGRATION_CITIZENCARE.md`.
 
 ## Decisioni tecniche
 

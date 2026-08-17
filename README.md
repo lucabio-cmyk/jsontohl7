@@ -26,11 +26,13 @@ hl7mw/
   webstatus.py   endpoint di stato di sola lettura, minimale (senza dipendenze)
   api.py         REST API + dashboard HTML (FastAPI, opzionale)
   cli.py         CLI operativa (ordini, retry, cancel, audit, stats)
-  adapters/      adapter per strumenti non-HL7 standard (es. HemoScreen)
+  adapters/      adapter per strumenti/fornitori non standard (HemoScreen, Citizen Care Connect)
+  vpn.py         gestione opzionale del tunnel VPN verso fornitori esterni (es. CCHS)
   run.py         runner del servizio (avvia tutti i componenti sopra)
 tests/           test end-to-end e di unità (senza pytest, eseguibili singolarmente)
+vpn/             template di configurazione VPN (WireGuard/OpenVPN) + guida setup
 config.example.json
-ARCHITECTURE.md  · CLAUDE.md (contesto per Claude Code)
+ARCHITECTURE.md  · CLAUDE.md (contesto per Claude Code) · INTEGRATION_CITIZENCARE.md
 ```
 
 ## Avvio
@@ -62,6 +64,26 @@ python3 -m hl7mw.cli --db hl7mw.db stats
 python3 -m hl7mw.cli --db hl7mw.db unmatched
 ```
 
+## Adapter Citizen Care Connect (CCHS) + VPN
+
+Adapter dedicato per il fornitore esterno **Citizen Care Connect** (Citizen Care
+Health Solutions): CCHS gioca il ruolo di uno strumento esterno raggiunto via VPN
+site-to-site — gli ordini `RECEIVED` gli vengono inoltrati come `ADT^A04` +
+`ORM^O01`, e i risultati tornano come `ORU^R01` rientrando nella pipeline standard.
+
+```bash
+# config.json
+"citizencare_enabled": true,
+"citizencare_host": "10.9.0.10", "citizencare_port": 2576,   # da onboarding CCHS
+"citizencare_result_listen_port": 6665,
+
+"vpn_enabled": true, "vpn_manage_lifecycle": false,          # tunnel gestito da systemd
+"vpn_health_check_host": "10.9.0.10", "vpn_health_check_port": 2576
+```
+
+Guida completa (richiesta dati onboarding, config WireGuard/OpenVPN, systemd,
+firewall, validazione) in **`INTEGRATION_CITIZENCARE.md`** e **`vpn/README.md`**.
+
 ## Test
 
 ```bash
@@ -69,6 +91,7 @@ python3 tests/test_e2e.py               # loop completo ordine -> risultato -> i
 python3 tests/test_management_system.py # API/store v2: dashboard, retry, audit, instruments
 python3 tests/test_ack_retry_backoff.py # retry/backoff su ACK del LIS
 python3 tests/test_hemoscreen.py        # adapter strumento HemoScreen (HL7 e POCT1-A2)
+python3 tests/test_citizencare.py       # adapter Citizen Care Connect + modulo VPN
 ```
 
 ## Stato attuale e prossimi passi
@@ -76,7 +99,7 @@ python3 tests/test_hemoscreen.py        # adapter strumento HemoScreen (HL7 e PO
 Funzionante e testato: ricezione ordini, ricezione/associazione risultati, inoltro al LIS
 con ACK (inclusi retry automatici su errori transitori), gestione risultati orfani,
 device monitoring con heartbeat/status, audit log clinico, REST API + dashboard web
-(Chart.js), CLI operativa completa.
+(Chart.js), CLI operativa completa, adapter Citizen Care Connect con VPN configurabile.
 
 Da sviluppare (vedi `ARCHITECTURE.md` → Roadmap e `CLAUDE.md` → "Da fare"): adapter
 **ASTM E1381/E1394** per strumenti non-HL7 generici, regola di completezza reale basata

@@ -38,5 +38,36 @@
   "hemoscreen_poct1a2_host": "0.0.0.0",
   "hemoscreen_poct1a2_port": 6664,
   "hemoscreen_poct1a2_continuous_mode": false,
-  "hemoscreen_poct1a2_timeout": 65.0
+  "hemoscreen_poct1a2_timeout": 65.0,
+
+  "_comment_citizencare": "Adapter Citizen Care Connect (CCHS) — vedi INTEGRATION_CITIZENCARE.md. host/port = endpoint CCHS forniti in onboarding, raggiunti via VPN.",
+
+  "citizencare_enabled": false,
+  "citizencare_host": "10.9.0.10",
+  "citizencare_port": 2576,
+  "citizencare_result_listen_host": "0.0.0.0",
+  "citizencare_result_listen_port": 6665,
+  "citizencare_sending_app": "",
+  "citizencare_sending_facility": "",
+  "citizencare_receiving_app": "CCHS",
+  "citizencare_receiving_facility": "CITIZENCARE",
+  "citizencare_ack_retry_attempts": 2,
+  "citizencare_ack_retry_backoff_seconds": 0.5,
+  "citizencare_connect_timeout": 10.0,
+  "citizencare_read_timeout": 30.0,
+
+  "_comment_vpn": "Tunnel VPN site-to-site verso il fornitore (es. CCHS). Con vpn_manage_lifecycle=false (consigliato) il middleware fa solo l'health-check su vpn_health_check_host/port; il tunnel va portato su a livello di sistema (vedi vpn/README.md).",
+
+  "vpn_enabled": false,
+  "vpn_provider": "wireguard",
+  "vpn_interface": "wg-cchs",
+  "vpn_config_path": "/etc/wireguard/wg-cchs.conf",
+  "vpn_up_command": "",
+  "vpn_down_command": "",
+  "vpn_manage_lifecycle": false,
+  "vpn_health_check_host": "",
+  "vpn_health_check_port": 0,
+  "vpn_health_check_timeout": 5.0,
+  "vpn_wait_seconds": 20.0,
+  "vpn_poll_interval": 1.0
 }

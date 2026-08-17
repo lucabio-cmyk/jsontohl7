@@ -65,9 +65,29 @@ python3 -m hl7mw.cli --db hl7mw.db unmatched       # risultati orfani
 
 ### Device Monitoring (`monitor.py`)
 - **`DeviceMonitor`** integrato nei Receiver: registra heartbeat ad ogni messaggio
+  (auto-registra lo strumento se nuovo — vedi `record_message`)
 - Aggiorna status ONLINE/OFFLINE basato su timeout (config: `device_offline_timeout_seconds`)
 - Traccia msg count per device
 - Audit log per cambio status (INFO online, WARNING offline)
+
+## Adapter Citizen Care Connect (CCHS) + VPN
+
+Fornitore esterno che riceve ordini e restituisce risultati via HL7 (vedi
+`INTEGRATION_CITIZENCARE.md`). Gioca il ruolo di uno strumento raggiunto via VPN
+site-to-site invece che via rete locale:
+
+- `hl7mw/adapters/citizencare.py` — `CitizenCareForwarder` (ordini `RECEIVED` →
+  `ADT^A04`+`ORM^O01` → CCHS, status `SENT_TO_CCHS`) e `CitizenCareResultReceiver`
+  (`ORU^R01` da CCHS → `pipeline.try_complete` standard → `READY`, poi il
+  `Forwarder` esistente lo inoltra al LIS). Matching per placer/filler order
+  number (CCHS non riceve/restituisce lo specimen barcode): vedi `Store.find_order`.
+- `hl7mw/vpn.py` — `VpnManager`: health-check sempre; avvio/arresto del tunnel
+  (wg-quick/openvpn/comando custom) solo se `vpn_manage_lifecycle: true`, altrimenti
+  gestito esternamente (systemd — consigliato in produzione). Solo stdlib
+  (subprocess/socket): niente crypto/tunneling reimplementato in Python.
+
+Abilitazione: `"citizencare_enabled": true` + `"vpn_enabled": true` in config.
+Template VPN (WireGuard/OpenVPN) e guida setup in `vpn/README.md`.
 
 ## Da fare (priorità)
 1. Adapter **ASTM E1381/E1394** per strumenti non-HL7 → produrre lo stesso dict di
@@ -75,6 +95,8 @@ python3 -m hl7mw.cli --db hl7mw.db unmatched       # risultati orfani
 2. Regola di **completezza** reale in `pipeline.try_complete` (test richiesti vs ricevuti).
 3. **Retry/backoff persistente** nel `Forwarder` (storico retry, DLQ).
 4. **Sicurezza**: TLS sul MLLP, autenticazione API, RBAC dashboard.
+5. Adapter CitizenCare: supporto `ADT^A08` (update paziente, dichiarato da CCHS ma
+   non ancora implementato); eventuale segmento SPM nell'ORM se CCHS arriva a supportarlo.
 
 ## Attenzione (dominio sanitario)
 Dati clinici reali: niente dati paziente nei log/commit, attenzione a sicurezza del

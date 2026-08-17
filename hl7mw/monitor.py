@@ -26,8 +26,18 @@ class DeviceMonitor:
         """Registra uno strumento nel database."""
         self.store.upsert_instrument(name, host, port, type_)
 
-    def record_message(self, instrument_name: str) -> None:
-        """Registra la ricezione di un messaggio da uno strumento."""
+    def record_message(self, instrument_name: str, host: str = "", port: int = 0,
+                        type_: str = "POCT") -> None:
+        """Registra la ricezione di un messaggio da uno strumento.
+
+        Auto-registra lo strumento se non è ancora presente in tabella (altrimenti
+        l'UPDATE di mark_instrument_message/set_instrument_heartbeat non ha effetto
+        su una riga inesistente e lo strumento non compare mai nella dashboard).
+        """
+        if not instrument_name:
+            return
+        if not self.store.get_instrument(instrument_name):
+            self.store.upsert_instrument(instrument_name, host, port, type_)
         self.store.mark_instrument_message(instrument_name)
         self.store.set_instrument_heartbeat(instrument_name, "ONLINE")
 
