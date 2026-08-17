@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .store import Store
 from . import vpn as vpnmod
+from .adapters import hemoscreen_poct1a2 as poct1a2
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -168,6 +169,142 @@ async def stop_vpn():
     if _store:
         _store.audit_log("vpn_down_triggered", details=f"provider={mgr.provider}", severity="INFO")
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Gestione strumento HemoScreen (POCT1-A2) — direttive verso il device
+# ---------------------------------------------------------------------------
+# Il device POCT1-A2 e' sempre l'iniziatore della connessione TCP: queste
+# direttive non vengono "spedite" a un indirizzo, ma accodate nella
+# conversazione attiva (in-process, vedi hl7mw/adapters/hemoscreen_poct1a2.py)
+# e recapitate al primo punto protocollarmente sicuro. 404 se nessun device
+# risulta connesso in questo momento a questo processo (uno strumento spento
+# o collegato a un'altra istanza del middleware non e' raggiungibile da qui).
+
+def _require_device(device_id: str, ok: bool) -> None:
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Nessun device POCT1-A2 connesso corrispondente a '{device_id}' "
+                   f"in questo momento (strumento spento o non collegato).",
+        )
+
+
+@app.get("/api/hemoscreen/devices")
+async def hemoscreen_devices():
+    """Elenco device_id/serial delle conversazioni POCT1-A2 attualmente connesse
+    a questo processo."""
+    return {"devices": poct1a2.connected_devices()}
+
+
+@app.post("/api/hemoscreen/{device_id}/lock")
+async def hemoscreen_lock(device_id: str):
+    """Accoda la direttiva LOCK (DTV.R01): impedisce ulteriori analisi sul device."""
+    ok = poct1a2.send_lock(device_id)
+    _require_device(device_id, ok)
+    if _store:
+        _store.audit_log("poct1a2_lock_queued", instrument=device_id, severity="WARNING")
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/unlock")
+async def hemoscreen_unlock(device_id: str):
+    """Accoda la direttiva UNLOCK (DTV.R01): ripristina il device dopo un LOCK."""
+    ok = poct1a2.send_unlock(device_id)
+    _require_device(device_id, ok)
+    if _store:
+        _store.audit_log("poct1a2_unlock_queued", instrument=device_id, severity="INFO")
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/set-time")
+async def hemoscreen_set_time(device_id: str, payload: dict | None = None):
+    """Accoda SET_TIME (DTV.R02): imposta l'orologio del device sull'ora locale
+    dell'Observation Reviewer (questo middleware), oppure su payload['dttm']
+    (ISO 8601) se specificato."""
+    dt = None
+    if payload and payload.get("dttm"):
+        try:
+            dt = datetime.fromisoformat(str(payload["dttm"]))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="dttm non valido: atteso ISO 8601")
+    ok = poct1a2.send_set_time(device_id, dt)
+    _require_device(device_id, ok)
+    if _store:
+        _store.audit_log("poct1a2_set_time_queued", instrument=device_id, severity="INFO")
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/operator-list")
+async def hemoscreen_operator_list(device_id: str, payload: dict):
+    """Accoda OPL.R01: lista operatori completa (sostituisce quella nel device).
+    payload: {"operators": [{"operator_id","permission_level_cd","method_cd"?}]}."""
+    operators = payload.get("operators")
+    if not isinstance(operators, list):
+        raise HTTPException(status_code=400, detail="Campo 'operators' (lista) obbligatorio")
+    ok = poct1a2.send_operator_list(device_id, operators)
+    _require_device(device_id, ok)
+    if _store:
+        _store.audit_log("poct1a2_operator_list_queued", instrument=device_id,
+                         details=f"{len(operators)} operatori", severity="INFO")
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/operator-list-incremental")
+async def hemoscreen_operator_list_incremental(device_id: str, payload: dict):
+    """Accoda OPL.R02: aggiornamento incrementale operatori.
+    payload: {"updates": [{"action_cd":"D"|"I","operators":[...]}]}."""
+    updates = payload.get("updates")
+    if not isinstance(updates, list):
+        raise HTTPException(status_code=400, detail="Campo 'updates' (lista) obbligatorio")
+    ok = poct1a2.send_operator_list_incremental(device_id, updates)
+    _require_device(device_id, ok)
+    if _store:
+        _store.audit_log("poct1a2_operator_list_incremental_queued", instrument=device_id,
+                         details=f"{len(updates)} aggiornamenti", severity="INFO")
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/qc-lot")
+async def hemoscreen_qc_lot(device_id: str, payload: dict):
+    """Accoda DTV.PIX.QC: un lotto di controllo qualita'.
+    payload: {"lot_number","expiration_date","revision","levels":{"H"|"N"|"L":[{...}]}}."""
+    for field in ("lot_number", "expiration_date", "revision", "levels"):
+        if field not in payload:
+            raise HTTPException(status_code=400, detail=f"Campo '{field}' obbligatorio")
+    ok = poct1a2.send_qc_lot(device_id, payload["lot_number"], payload["expiration_date"],
+                              payload["revision"], payload["levels"])
+    _require_device(device_id, ok)
+    if _store:
+        _store.audit_log("poct1a2_qc_lot_queued", instrument=device_id,
+                         details=payload["lot_number"], severity="INFO")
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/gender-normal-range")
+async def hemoscreen_gender_normal_range(device_id: str, payload: dict):
+    """Accoda DTV.PIX.FB: range di normalita' per genere.
+    payload: {"effective_date","genders":{"M"|"F":[{...}]}}."""
+    for field in ("effective_date", "genders"):
+        if field not in payload:
+            raise HTTPException(status_code=400, detail=f"Campo '{field}' obbligatorio")
+    ok = poct1a2.send_gender_normal_range(device_id, payload["effective_date"], payload["genders"])
+    _require_device(device_id, ok)
+    if _store:
+        _store.audit_log("poct1a2_gender_normal_range_queued", instrument=device_id, severity="INFO")
+    return {"status": "queued"}
+
+
+@app.post("/api/hemoscreen/{device_id}/device-setup")
+async def hemoscreen_device_setup(device_id: str, payload: dict):
+    """Accoda DTV.PIX.DVCSET: setup strumento (modo operativo, lingua, unita' di
+    misura, parametri visualizzati, demografia, lockdown) — vedi
+    hl7mw/adapters/hemoscreen_poct1a2.py:build_dtv_pix_dvcset per la struttura attesa."""
+    ok = poct1a2.send_device_setup(device_id, payload)
+    _require_device(device_id, ok)
+    if _store:
+        _store.audit_log("poct1a2_device_setup_queued", instrument=device_id, severity="INFO")
+    return {"status": "queued"}
 
 
 @app.get("/api/dashboard")

@@ -24,8 +24,11 @@ from hl7mw.adapters.hemoscreen_poct1a2 import (
     parse_obs_r01,
     parse_obs_r02,
     HemoscreenPoct1A2Receiver,
-    _xml_ack, _xml_req_obs, _xml_end,
+    _xml_ack, _xml_req, _xml_end,
     _mllp_send, _mllp_recv,
+    build_dtv_set_time, build_opl_r01, build_opl_r02, build_ptl_r01,
+    build_dtv_pix_qc, build_dtv_pix_fb, build_dtv_pix_dvcset,
+    send_lock, send_unlock, send_operator_list, connected_devices,
 )
 
 import xml.etree.ElementTree as ET
@@ -251,6 +254,61 @@ def _device_ack(ctrl: str, ack_ctrl: str) -> str:
             f'<ACK><ACK.type_cd V="AA" />'
             f'<ACK.control_id V="{ack_ctrl}" /></ACK>'
             f'</ACK.R01>')
+
+
+def _build_dst_full(ctrl: str, new_obs: int = 0, new_events: int = 0) -> str:
+    return (f'<DST.R01><HDR>'
+            f'<HDR.control_id V="{ctrl}" />'
+            f'<HDR.version_id V="POCT1" />'
+            f'<HDR.creation_dttm V="2024-01-01T10:00:01+00:00" />'
+            f'</HDR>'
+            f'<DST>'
+            f'<DST.status_dttm V="2024-01-01T10:00:01+00:00" />'
+            f'<DST.new_observations_qty V="{new_obs}" />'
+            f'<DST.new_events_qty V="{new_events}" />'
+            f'<DST.condition_cd V="R" SN="POCT1" SV="1" />'
+            f'</DST>'
+            f'</DST.R01>')
+
+
+def _build_eot_topic(ctrl: str, topic_cd: str) -> str:
+    return (f'<EOT.R01><HDR>'
+            f'<HDR.control_id V="{ctrl}" />'
+            f'<HDR.version_id V="POCT1" />'
+            f'<HDR.creation_dttm V="2024-01-01T10:00:10+00:00" />'
+            f'</HDR>'
+            f'<EOT><EOT.topic_cd V="{topic_cd}" SN="POCT1" SV="1" /></EOT>'
+            f'</EOT.R01>')
+
+
+def _build_esc(ctrl: str, esc_ctrl: str, detail: str = "OTH") -> str:
+    return (f'<ESC.R01><HDR>'
+            f'<HDR.control_id V="{ctrl}" />'
+            f'<HDR.version_id V="POCT1" />'
+            f'<HDR.creation_dttm V="2024-01-01T10:00:03+00:00" />'
+            f'</HDR>'
+            f'<ESC><ESC.esc_control_id V="{esc_ctrl}" />'
+            f'<ESC.detail_cd V="{detail}" /></ESC>'
+            f'</ESC.R01>')
+
+
+def _build_req_rpat(ctrl: str, test_id: str) -> str:
+    return (f'<REQ.R01><HDR>'
+            f'<HDR.control_id V="{ctrl}" />'
+            f'<HDR.version_id V="POCT1" />'
+            f'<HDR.creation_dttm V="2024-01-01T10:00:04+00:00" />'
+            f'</HDR>'
+            f'<REQ><REQ.request_cd V="RPAT" />'
+            f'<PT><PT.patient_id V="{test_id}" /></PT></REQ>'
+            f'</REQ.R01>')
+
+
+def _build_kpa(ctrl: str) -> str:
+    return (f'<KPA.R01><HDR>'
+            f'<HDR.control_id V="{ctrl}" />'
+            f'<HDR.version_id V="POCT1" />'
+            f'<HDR.creation_dttm V="2024-01-01T10:00:05+00:00" />'
+            f'</HDR></KPA.R01>')
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +611,296 @@ def test_poct1a2_unmatched():
 
 
 # ---------------------------------------------------------------------------
+# Test POCT1-A2: builder delle direttive (roundtrip XML)
+# ---------------------------------------------------------------------------
+
+def test_poct1a2_directive_builders():
+    """Builder delle direttive: struttura XML conforme a HS-IL-00067 §4.3-4.4."""
+    xml = build_dtv_set_time("1", None)
+    root = ET.fromstring(xml)
+    assert root.tag == "DTV.R02"
+    assert root.find(".//DTV.command_cd").get("V") == "SET_TIME"
+    assert root.find(".//TM.dttm") is not None
+
+    xml = build_opl_r01("1", [
+        {"operator_id": "OPERATOR1", "permission_level_cd": "1"},
+        {"operator_id": "OPERATOR2", "permission_level_cd": "4", "method_cd": "ALL"},
+    ])
+    root = ET.fromstring(xml)
+    assert root.tag == "OPL.R01"
+    oprs = root.findall("OPR")
+    assert len(oprs) == 2
+    assert oprs[0].find("OPR.operator_id").get("V") == "OPERATOR1"
+    assert oprs[0].find(".//ACC.permission_level_cd").get("V") == "1"
+
+    xml = build_opl_r02("1", [
+        {"action_cd": "D", "operators": [{"operator_id": "OPERATOR1"}]},
+        {"action_cd": "I", "operators": [{"operator_id": "OPERATOR4", "permission_level_cd": "4"}]},
+    ])
+    root = ET.fromstring(xml)
+    assert root.tag == "OPL.R02"
+    upds = root.findall("UPD")
+    assert len(upds) == 2
+    assert upds[0].find("UPD.action_cd").get("V") == "D"
+    assert upds[0].find(".//OPR.operator_id").get("V") == "OPERATOR1"
+    assert upds[1].find(".//ACC.permission_level_cd").get("V") == "4"
+
+    xml = build_ptl_r01("1", {"patient_id": "123456", "last_name": "Larsen",
+                              "first_name": "Allan", "birth_date": "1975-10-21",
+                              "gender_cd": "M"})
+    root = ET.fromstring(xml)
+    assert root.tag == "PTL.R01"
+    assert root.find(".//PT.patient_id").get("V") == "123456"
+    assert root.find(".//FAM").get("V") == "Larsen"
+    assert root.find(".//GIV").get("V") == "Allan"
+
+    xml = build_ptl_r01("1", None)
+    root = ET.fromstring(xml)
+    assert root.find("PT") is None, "lista paziente vuota non deve avere sezione PT"
+
+    xml = build_dtv_pix_qc("1", "PIX201205", "2020-12-05", "01", {
+        "N": [{"observation_id": "6690-2", "dn": "WBC", "lo": "4", "hi": "11.5", "unit": "10*3/uL"}],
+    })
+    root = ET.fromstring(xml)
+    assert root.tag == "DTV.PIX.QC"
+    assert root.find(".//LOT.lot_number").get("V") == "PIX201205"
+    assert root.find(".//LEVEL.level_cd").get("V") == "N"
+    assert root.find(".//PARAM.normal_lo-hi_limit").get("V") == "[4;11.5]"
+
+    xml = build_dtv_pix_fb("1", "2020-02-15", {
+        "F": [{"observation_id": "6690-2", "dn": "WBC", "lo": "4", "hi": "11.5", "unit": "10*3/uL"}],
+    })
+    root = ET.fromstring(xml)
+    assert root.tag == "DTV.PIX.FB"
+    assert root.find(".//FBNR.effective_date").get("V") == "2020-02-15"
+    assert root.find(".//GENDER.gender_cd").get("V") == "F"
+
+    xml = build_dtv_pix_dvcset("1", {
+        "opermode_cd": "CBC_5part", "language_cd": "English",
+        "unit": {"wbc5part_cd": "10*3/uL"},
+        "prmdis": {"wbc_cd": "SHOW"},
+        "demogra": {"gender_cd": "ENABLE"},
+        "lockdown": {"lockdown_mode_cd": "DISABLE"},
+    })
+    root = ET.fromstring(xml)
+    assert root.tag == "DTV.PIX.DVCSET"
+    assert root.find(".//DVCSET.opermode_cd").get("V") == "CBC_5part"
+    assert root.find(".//UNIT.wbc5part_cd").get("V") == "10*3/uL"
+    assert root.find(".//PRMDIS.wbc_cd").get("V") == "SHOW"
+
+    print("[10] Builder direttive POCT1-A2 (SET_TIME/OPL/PTL/QC/FB/DVCSET): struttura XML OK")
+
+
+# ---------------------------------------------------------------------------
+# Test POCT1-A2: ESC.R01, REQ.R01(RDEV), REQ.R01(RPAT)->PTL.R01, direttive live
+# ---------------------------------------------------------------------------
+
+def test_poct1a2_esc_and_rdev():
+    """DST.R01 con solo eventi pendenti -> REQ.R01(RDEV) (non ROBS); ESC.R01 non riceve
+    risposta (bug storico: finiva nel ramo 'sconosciuto' con un ACK AE errato)."""
+    store = Store("/tmp/hl7mw_test_hs5.db")
+    Path("/tmp/hl7mw_test_hs5.db").unlink(missing_ok=True)
+    store = Store("/tmp/hl7mw_test_hs5.db")
+
+    rx = HemoscreenPoct1A2Receiver(store, "127.0.0.1", 0, continuous_mode=False, timeout=5.0)
+    rx.start()
+    srv_port = rx._srv.server_address[1]
+
+    try:
+        with socket.create_connection(("127.0.0.1", srv_port), timeout=5.0) as s:
+            s.settimeout(5.0)
+            buf = bytearray()
+            _mllp_send(s, _build_hel("1"))
+            _mllp_recv(s, 5.0, buf)  # ACK HEL
+
+            # 0 osservazioni, 2 eventi pendenti -> ci si aspetta REQ.R01(RDEV), non ROBS
+            _mllp_send(s, _build_dst_full("2", new_obs=0, new_events=2))
+            _mllp_recv(s, 5.0, buf)  # ACK DST
+            raw_req = _mllp_recv(s, 5.0, buf)
+            assert raw_req, "nessun REQ.R01 ricevuto"
+            req_root = ET.fromstring(raw_req.decode())
+            assert req_root.tag == "REQ.R01"
+            assert req_root.find(".//REQ.request_cd").get("V") == "RDEV", \
+                "atteso REQ.R01(RDEV) quando new_obs=0 e new_events>0"
+
+            # EVS.R01 con un evento -> deve finire su audit_log
+            req_ctrl = req_root.find(".//HDR.control_id").get("V", "")
+            _mllp_send(s, _device_ack("3", req_ctrl))
+            evs = ('<EVS.R01><HDR><HDR.control_id V="4" /><HDR.version_id V="POCT1" />'
+                   '<HDR.creation_dttm V="2024-01-01T10:00:06+00:00" /></HDR>'
+                   '<EVT><EVT.description V="Errore di test" />'
+                   '<EVT.event_dttm V="2024-01-01T10:00:06+00:00" />'
+                   '<EVT.severity_cd V="W" /><EVT.number V="131228" />'
+                   '<EVT.mode V="NORMAL" /></EVT></EVS.R01>')
+            _mllp_send(s, evs)
+            raw = _mllp_recv(s, 5.0, buf)
+            assert raw and ET.fromstring(raw.decode()).tag == "ACK.R01"
+
+            # EOT del topic eventi -> nessuna richiesta pendente -> END.R01
+            _mllp_send(s, _build_eot_topic("5", "D_EV"))
+            _mllp_recv(s, 5.0, buf)  # ACK EOT
+            raw_end = _mllp_recv(s, 5.0, buf)
+            assert raw_end, "nessun END.R01 dopo l'ultimo topic pendente"
+            end_root = ET.fromstring(raw_end.decode())
+            assert end_root.tag == "END.R01"
+
+            # ESC.R01 al posto dell'ACK finale: nessuna risposta prevista, la
+            # connessione resta "appesa" finché non chiudiamo noi lato test.
+            end_ctrl = end_root.find(".//HDR.control_id").get("V", "")
+            _mllp_send(s, _build_esc("6", end_ctrl))
+            s.settimeout(1.0)
+            try:
+                extra = _mllp_recv(s, 1.0, buf)
+                assert not extra, f"ESC.R01 non deve ricevere risposta, ottenuto: {extra!r}"
+            except socket.timeout:
+                pass
+
+        time.sleep(0.2)
+        audit = store.get_audit_log(limit=20)
+        assert any(a["event_type"] == "poct1a2_device_event" for a in audit), \
+            "EVS.R01 deve essere persistito su audit_log"
+        assert any(a["event_type"] == "poct1a2_escape" for a in audit), \
+            "ESC.R01 deve essere persistito su audit_log"
+        print("[11] ESC.R01 senza risposta, REQ.R01(RDEV) su soli eventi, EVS.R01 su audit_log  OK")
+    finally:
+        rx.stop()
+
+
+def test_poct1a2_continuous_rpat_and_directives():
+    """Modalità continua: avvio, rifiuto via ESC, richiesta paziente (RPAT->PTL.R01)
+    e invio di una direttiva live (LOCK) accodata da fuori la conversazione."""
+    store = Store("/tmp/hl7mw_test_hs6.db")
+    Path("/tmp/hl7mw_test_hs6.db").unlink(missing_ok=True)
+    store = Store("/tmp/hl7mw_test_hs6.db")
+
+    order = {
+        "sample_key": "PAT-777", "placer_order_number": "", "filler_order_number": "",
+        "specimen_id": "PAT-777",
+        "patient": {"id": "PAT-777", "last_name": "Rossi", "first_name": "Mario",
+                    "birth_date": "19800101", "sex": "M"},
+        "universal_service_id": {"code": "58410-2", "text": "Emocromo", "system": "LN"},
+        "message_control_id": "ORD003", "message_type": "ORM^O01",
+        "ordering_provider": "", "requested_datetime": "20240101100000", "raw": "",
+    }
+    store.upsert_order(order)
+
+    rx = HemoscreenPoct1A2Receiver(store, "127.0.0.1", 0, continuous_mode=True, timeout=5.0)
+    rx.start()
+    srv_port = rx._srv.server_address[1]
+
+    try:
+        with socket.create_connection(("127.0.0.1", srv_port), timeout=5.0) as s:
+            s.settimeout(5.0)
+            buf = bytearray()
+            _mllp_send(s, _build_hel("1"))
+            _mllp_recv(s, 5.0, buf)  # ACK HEL
+
+            # Nessuna osservazione/evento pendente -> il server tenta subito START_CONTINUOUS
+            _mllp_send(s, _build_dst_full("2", new_obs=0, new_events=0))
+            _mllp_recv(s, 5.0, buf)  # ACK DST
+            raw = _mllp_recv(s, 5.0, buf)
+            dtv_root = ET.fromstring(raw.decode())
+            assert dtv_root.tag == "DTV.R01"
+            assert dtv_root.find(".//DTV.command_cd").get("V") == "START_CONTINUOUS"
+            start_ctrl = dtv_root.find(".//HDR.control_id").get("V", "")
+
+            # Il device accetta (ACK positivo)
+            _mllp_send(s, _device_ack("3", start_ctrl))
+
+            assert "0001-HS" in connected_devices(), \
+                "il device deve comparire nel registro conversazioni attive dopo HEL.R01"
+
+            # Il device chiede i dati del paziente TEST_ID=PAT-777 (RPAT)
+            _mllp_send(s, _build_req_rpat("4", "PAT-777"))
+            raw = _mllp_recv(s, 5.0, buf)
+            ptl_root = ET.fromstring(raw.decode())
+            assert ptl_root.tag == "PTL.R01"
+            assert ptl_root.find(".//PT.patient_id").get("V") == "PAT-777"
+            assert ptl_root.find(".//FAM").get("V") == "Rossi"
+            ptl_ctrl = ptl_root.find(".//HDR.control_id").get("V", "")
+            _mllp_send(s, _device_ack("5", ptl_ctrl))
+
+            # Richiesta per un Test ID sconosciuto -> PTL.R01 con lista vuota
+            _mllp_send(s, _build_req_rpat("6", "SCONOSCIUTO"))
+            raw = _mllp_recv(s, 5.0, buf)
+            ptl_root2 = ET.fromstring(raw.decode())
+            assert ptl_root2.tag == "PTL.R01"
+            assert ptl_root2.find("PT") is None
+            ptl_ctrl2 = ptl_root2.find(".//HDR.control_id").get("V", "")
+            _mllp_send(s, _device_ack("7", ptl_ctrl2))
+
+            # Keep-alive "di sincronizzazione": attendendone l'ACK siamo certi che il
+            # server abbia già processato (e drenato, trovandola vuota) la coda
+            # direttive fino a questo punto, prima di accodare la LOCK qui sotto —
+            # altrimenti l'accodamento (thread separato dal server) potrebbe correre
+            # in parallelo con un giro di drenaggio già in corso lato server.
+            _mllp_send(s, _build_kpa("8"))
+            _mllp_recv(s, 5.0, buf)  # ACK KPA (sincronizzazione)
+
+            # Direttiva LOCK accodata da fuori la conversazione (es. API/CLI): essendo
+            # stata messa in coda dopo la conferma sopra, il prossimo keep-alive la
+            # troverà di sicuro pronta da inviare.
+            assert send_lock("0001-HS") is True
+
+            _mllp_send(s, _build_kpa("9"))
+            _mllp_recv(s, 5.0, buf)  # ACK KPA
+            raw = _mllp_recv(s, 5.0, buf)
+            assert raw, "nessuna direttiva LOCK ricevuta dopo il keep-alive"
+            lock_root = ET.fromstring(raw.decode())
+            assert lock_root.tag == "DTV.R01"
+            assert lock_root.find(".//DTV.command_cd").get("V") == "LOCK"
+            lock_ctrl = lock_root.find(".//HDR.control_id").get("V", "")
+            _mllp_send(s, _device_ack("10", lock_ctrl))
+
+        time.sleep(0.2)
+        print("[12] Modalita' continua: START_CONTINUOUS, REQ.R01(RPAT)->PTL.R01, "
+              "direttiva LOCK accodata da fuori la conversazione  OK")
+    finally:
+        rx.stop()
+
+
+def test_poct1a2_continuous_rejected():
+    """Il device rifiuta la modalità continua con ESC.R01: continuous_active resta False
+    e non deve bloccare la chiusura successiva della conversazione con END.R01."""
+    store = Store("/tmp/hl7mw_test_hs7.db")
+    Path("/tmp/hl7mw_test_hs7.db").unlink(missing_ok=True)
+    store = Store("/tmp/hl7mw_test_hs7.db")
+
+    rx = HemoscreenPoct1A2Receiver(store, "127.0.0.1", 0, continuous_mode=True, timeout=5.0)
+    rx.start()
+    srv_port = rx._srv.server_address[1]
+
+    try:
+        with socket.create_connection(("127.0.0.1", srv_port), timeout=5.0) as s:
+            s.settimeout(5.0)
+            _mllp_send(s, _build_hel("1"))
+            _mllp_recv(s, 5.0)
+            _mllp_send(s, _build_dst_full("2", new_obs=0, new_events=0))
+            _mllp_recv(s, 5.0)
+            raw = _mllp_recv(s, 5.0)
+            dtv_root = ET.fromstring(raw.decode())
+            assert dtv_root.tag == "DTV.R01"
+            start_ctrl = dtv_root.find(".//HDR.control_id").get("V", "")
+
+            # Il device rifiuta la modalita' continua
+            _mllp_send(s, _build_esc("3", start_ctrl, detail="OTH"))
+
+            # La connessione deve restare aperta e funzionante (es. un successivo
+            # keep-alive viene ancora ACKato normalmente)
+            _mllp_send(s, _build_kpa("4"))
+            raw = _mllp_recv(s, 5.0)
+            assert raw and ET.fromstring(raw.decode()).tag == "ACK.R01"
+
+        time.sleep(0.2)
+        audit = store.get_audit_log(limit=20)
+        assert any(a["event_type"] == "poct1a2_escape" for a in audit)
+        print("[13] Rifiuto modalita' continua (ESC.R01 su START_CONTINUOUS) gestito "
+              "senza bloccare la conversazione  OK")
+    finally:
+        rx.stop()
+
+
+# ---------------------------------------------------------------------------
 # Esecuzione
 # ---------------------------------------------------------------------------
 
@@ -568,6 +916,10 @@ def main():
         test_parse_obs_r02,
         test_poct1a2_conversation,
         test_poct1a2_unmatched,
+        test_poct1a2_directive_builders,
+        test_poct1a2_esc_and_rdev,
+        test_poct1a2_continuous_rpat_and_directives,
+        test_poct1a2_continuous_rejected,
     ]
     for fn in tests:
         try:

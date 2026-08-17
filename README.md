@@ -32,6 +32,7 @@ hl7mw/
 tests/           test end-to-end e di unità (senza pytest, eseguibili singolarmente)
 vpn/             template di configurazione VPN (WireGuard/OpenVPN) + guida setup
 config.example.json
+config.dedalus-cchs.example.json   esempio concreto: LIS Dedalus in sostituzione di CCHS (vedi INTEGRATION_CITIZENCARE.md §9)
 ARCHITECTURE.md  · CLAUDE.md (contesto per Claude Code) · INTEGRATION_CITIZENCARE.md
 ```
 
@@ -128,6 +129,38 @@ indipendentemente da CCHS/LIS.
 Guida completa (ruoli, dati da raccogliere per la sostituzione, config
 WireGuard/OpenVPN, systemd, firewall, validazione) in
 **`INTEGRATION_CITIZENCARE.md`** e **`vpn/README.md`**.
+
+## Gestione HemoScreen (POCT1-A2)
+
+Oltre alla ricezione risultati (OBS.R01 sangue, OBS.R02 QC/EQA — vedi
+`hl7mw/adapters/hemoscreen_poct1a2.py`), l'adapter POCT1-A2 implementa l'intero
+profilo HS-IL-00067 Rev.06 previsto per l'Observation Reviewer: richiesta
+osservazioni/eventi pendenti (REQ.R01 ROBS/RDEV), modalità continua
+(DTV.R01 START_CONTINUOUS, con gestione del rifiuto via ESC.R01), risposta
+alle richieste paziente del device in modalità continua (REQ.R01 RPAT →
+PTL.R01) ed eventi strumento persistiti su audit log (EVS.R01). `DTV.PIX.FW`
+(firmware) non è implementato: la spec lo dichiara "draft e non rilasciato".
+
+Il device è sempre l'iniziatore della connessione TCP: le direttive verso lo
+strumento (lock/unlock, ora, liste operatori, lotti QC, range di normalità
+per genere, setup) non si "inviano" a un indirizzo ma si **accodano** nella
+conversazione attiva e vengono recapitate al primo punto protocollarmente
+sicuro — via REST API (stesso processo del middleware in esecuzione):
+
+```bash
+GET  /api/hemoscreen/devices                              # device_id/serial connessi ora
+POST /api/hemoscreen/{device_id}/lock
+POST /api/hemoscreen/{device_id}/unlock
+POST /api/hemoscreen/{device_id}/set-time                 # body opzionale {"dttm": "2026-01-01T10:00:00+01:00"}
+POST /api/hemoscreen/{device_id}/operator-list             # {"operators": [{"operator_id","permission_level_cd"}]}
+POST /api/hemoscreen/{device_id}/operator-list-incremental  # {"updates": [{"action_cd":"D"|"I","operators":[...]}]}
+POST /api/hemoscreen/{device_id}/qc-lot                    # {"lot_number","expiration_date","revision","levels":{"H"|"N"|"L":[...]}}
+POST /api/hemoscreen/{device_id}/gender-normal-range        # {"effective_date","genders":{"M"|"F":[...]}}
+POST /api/hemoscreen/{device_id}/device-setup               # struttura DTV.PIX.DVCSET, vedi build_dtv_pix_dvcset()
+```
+
+`404` se nessun device con quell'identificativo è connesso in questo momento
+a questo processo. Ogni direttiva accodata è tracciata su audit log.
 
 ## Test
 

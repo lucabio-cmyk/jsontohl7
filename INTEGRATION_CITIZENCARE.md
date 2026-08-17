@@ -160,7 +160,51 @@ Dal cliente/da chi gestisce il LIS (non da CCHS, che stiamo sostituendo):
    `api_enabled: true`), che mostra stato e timing (`received_at`,
    `first_result_at`, `ready_at`, `sent_at`) di ogni passaggio.
 
-## 8. Limiti noti
+## 8. Esempio concreto — LIS Dedalus (schema a 3 porte)
+
+Ricostruito da evidenza raccolta in un ambiente reale (`netstat` sull'host che
+oggi esegue il fornitore CCHS + log applicativo del processo "EMR Bridge"):
+
+```
+$ netstat -putna | grep -E '6000|6001|10100'
+tcp  ESTABLISHED  <host>:6000  172.25.13.1:*        (PID del processo EMR Bridge)
+tcp  ESTABLISHED  <host>:6001  172.25.13.1:*
+tcp  LISTEN       0.0.0.0:10100
+```
+```
+[INFO] Dedalus ADT to EMR Bridge: New connection from ('10.250.227.20', 44182)
+[INFO] Dedalus ORM to EMR Bridge: New connection from ('10.250.227.20', 43488)
+```
+
+I nomi dei due log ("Dedalus ADT to EMR Bridge" / "Dedalus ORM to EMR Bridge")
+confermano lo schema Dedalus descritto al §4: **ADT e ORM viaggiano su due
+connessioni MLLP separate**, non su un canale unico — coerente con la nota
+dello sviluppatore CCHS: *"tre porte diverse: una per i pazienti (ADT), una
+per gli ordini (ORM) e una per i risultati (ORU). ADT e ORM sono gestiti dal
+cliente [il LIS li invia], mentre ORU è gestito dal fornitore [il LIS lo
+riceve], e i server ricevono ADT e ORM"* — esattamente il ruolo di
+`adt_listen_port`/`order_listen_port` (in ascolto, riceviamo) e `lis_host`/
+`lis_port` (in uscita, inviamo l'ORU) di questo middleware.
+
+Config pronta all'uso in **`config.dedalus-cchs.example.json`** (anche
+caricabile/adattabile dalla GUI Impostazioni → sezione LIS). Valori:
+
+| Chiave | Valore | Stato |
+|---|---|---|
+| `adt_listen_port` | `6000` | Plausibile dal netstat; **DA_VERIFICARE** quale delle due porte è davvero ADT (il log conferma che i due canali esistono, non l'associazione porta↔tipo) |
+| `order_listen_port` | `6001` | Idem, per ORM |
+| `order_listen_host` / `adt_listen_host` | `0.0.0.0` | Endpoint di questo middleware — non richiede verifica |
+| `lis_host` / `lis_port` | — | **DA_VERIFICARE**: sono l'endpoint del *vero* LIS dove inviamo l'ORU di ritorno, un dato diverso da quelli sopra (che sono dove *noi* ascoltiamo) e non deducibile dal netstat raccolto finora |
+| ruolo della porta `10100` (LISTEN) | — | **DA_VERIFICARE**: non è detto sia `lis_port` — potrebbe essere un canale interno del fornitore CCHS (status/keep-alive) da non replicare |
+| `receiving_app` / `receiving_facility` | — | **DA_VERIFICARE** con chi gestisce il LIS (MSH-5/6 attesi nell'ORU) |
+
+Prima di andare live su questo scenario: confermare con il fornitore/gestore
+del LIS Dedalus i tre campi **DA_VERIFICARE** sopra (bastano un test ADT/ORM
+verso ciascuna delle due porte osservate e la porta di ascolto ORU sul LIS),
+poi salvare la config finale dalla GUI Impostazioni (richiede riavvio del
+servizio, vedi §4 sopra).
+
+## 9. Limiti noti
 
 - `ADT^A08` (aggiornamento paziente) è dichiarato come supportato da CCHS nella
   spec (§5.2) ma non ancora distinto: `_handle_adt` accetta qualunque

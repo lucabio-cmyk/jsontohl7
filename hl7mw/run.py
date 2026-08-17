@@ -194,6 +194,7 @@ def main(argv=None) -> int:
             cfg["hemoscreen_poct1a2_port"],
             continuous_mode=cfg["hemoscreen_poct1a2_continuous_mode"],
             timeout=cfg["hemoscreen_poct1a2_timeout"],
+            monitor=monitor,
         ).start()
 
     signal.signal(signal.SIGINT, _sig)

@@ -82,6 +82,16 @@ def _post(url: str) -> tuple[int, dict]:
         return e.code, json.loads(e.read())
 
 
+def _post_json(url: str, body: dict) -> tuple[int, dict]:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
 def test_config_roundtrip_and_validation():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = Store(str(Path(tmpdir) / "test.db"))
@@ -213,6 +223,74 @@ def test_vpn_down_raises_on_failure():
     print("[13] VpnManager.down(): solleva VpnError se il comando fallisce  OK")
 
 
+def test_hemoscreen_endpoints():
+    """Endpoint di gestione HemoScreen POCT1-A2 (/api/hemoscreen/...): 404 se
+    nessun device e' connesso a questo processo, 400 su payload incompleto,
+    accodamento verso la conversazione attiva quando il device e' connesso
+    (simulato registrando una conversazione fittizia nel registro in-process,
+    senza aprire una vera connessione TCP — il flusso di conversazione reale
+    e' gia' coperto da tests/test_hemoscreen.py)."""
+    from hl7mw.adapters import hemoscreen_poct1a2 as poct1a2
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = Store(str(Path(tmpdir) / "test.db"))
+        app = hl7mw_api.init_api(store, str(Path(tmpdir) / "config.json"), DEFAULTS)
+
+        port = _free_port()
+        server, thread = _start_server(app, "127.0.0.1", port)
+        base = f"http://127.0.0.1:{port}"
+        try:
+            status, data = _get(f"{base}/api/hemoscreen/devices")
+            assert status == 200 and data["devices"] == []
+            print("[14] GET /api/hemoscreen/devices senza device connessi -> lista vuota  OK")
+
+            status, data = _post(f"{base}/api/hemoscreen/UNKNOWN/lock")
+            assert status == 404
+            print("[15] POST /api/hemoscreen/{id}/lock su device non connesso -> 404  OK")
+
+            status, data = _post_json(f"{base}/api/hemoscreen/UNKNOWN/operator-list", {})
+            assert status == 400 and "operators" in data["detail"]
+            print("[16] POST /api/hemoscreen/{id}/operator-list senza 'operators' -> 400  OK")
+
+            class _FakeConv:
+                def __init__(self):
+                    self.calls = []
+
+                def enqueue_directive(self, builder, topic_cd_after_ack, label):
+                    self.calls.append((builder("1"), topic_cd_after_ack, label))
+
+            fake = _FakeConv()
+            with poct1a2._REGISTRY_LOCK:
+                poct1a2._REGISTRY["FAKE-001"] = fake
+            try:
+                status, data = _post(f"{base}/api/hemoscreen/FAKE-001/lock")
+                assert status == 200 and data["status"] == "queued"
+                assert fake.calls and "LOCK" in fake.calls[-1][0]
+
+                status, data = _post_json(
+                    f"{base}/api/hemoscreen/FAKE-001/operator-list",
+                    {"operators": [{"operator_id": "OP1", "permission_level_cd": "1"}]},
+                )
+                assert status == 200
+                assert fake.calls[-1][1] == "OP_LST", "OPL.R01 deve richiedere un EOT(OP_LST) dopo l'ACK"
+
+                status, data = _post_json(f"{base}/api/hemoscreen/FAKE-001/qc-lot", {
+                    "lot_number": "PIX201205", "expiration_date": "2020-12-05", "revision": "01",
+                    "levels": {"N": [{"observation_id": "6690-2", "lo": "4", "hi": "11.5"}]},
+                })
+                assert status == 200
+                assert "DTV.PIX.QC" in fake.calls[-1][0]
+            finally:
+                with poct1a2._REGISTRY_LOCK:
+                    poct1a2._REGISTRY.pop("FAKE-001", None)
+
+            audit = store.get_audit_log(limit=20)
+            assert any(a["event_type"] == "poct1a2_lock_queued" for a in audit)
+            print("[17] Endpoint direttive HemoScreen: accodamento verso conversazione attiva + audit_log  OK")
+        finally:
+            _stop_server(server, thread)
+
+
 if __name__ == "__main__":
     if not FASTAPI_AVAILABLE:
         print("fastapi/uvicorn non installati: test saltato (pip install -e \".[api]\").")
@@ -221,4 +299,5 @@ if __name__ == "__main__":
     test_vpn_check_endpoint()
     test_vpn_up_down_endpoints()
     test_vpn_down_raises_on_failure()
+    test_hemoscreen_endpoints()
     print("\nTUTTI I TEST CONFIG API OK")

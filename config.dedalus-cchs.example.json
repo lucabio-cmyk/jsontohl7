@@ -1,0 +1,69 @@
+{
+  "_readme": "Config di esempio per sostituire Citizen Care Connect (CCHS) davanti a un LIS Dedalus che apre due connessioni MLLP separate verso l'EMR Bridge (schema confermato da netstat + log applicativo raccolti in produzione, vedi INTEGRATION_CITIZENCARE.md §9). Valori segnati DA_VERIFICARE vanno confermati sul campo prima di andare live: non sono ipotesi affidabili, solo placeholder plausibili in base all'evidenza raccolta finora.",
+
+  "db_path": "hl7mw.db",
+
+  "_comment_adt_ordine": "Dal netstat: il processo EMR Bridge (oggi CCHS) ha due connessioni MLLP stabilite dal LIS Dedalus, una per canale (log: 'Dedalus ADT to EMR Bridge' / 'Dedalus ORM to EMR Bridge'). Porte 6000/6001 osservate; l'associazione 6000=ADT/6001=ORM è la piu' plausibile ma DA_VERIFICARE con chi gestisce il LIS (il log conferma che i due canali esistono, non quale porta serve quale tipo di messaggio).",
+
+  "order_listen_host": "0.0.0.0",
+  "order_listen_port": 6001,
+
+  "adt_listen_host": "",
+  "adt_listen_port": 6000,
+
+  "result_listen_host": "0.0.0.0",
+  "result_listen_port": 6662,
+
+  "_comment_lis": "lis_host/lis_port sono l'endpoint del VERO LIS Dedalus dove il middleware invia l'ORU^R01 di ritorno (al posto di CCHS) — NON coincidono con order_listen_port/adt_listen_port, che sono invece dove QUESTO middleware ascolta le connessioni in ingresso dal LIS. Il netstat mostrava anche una porta 10100 in LISTEN sul lato EMR Bridge: ruolo DA_VERIFICARE (non necessariamente e' lis_port — potrebbe essere un canale diverso, es. status/keep-alive del fornitore CCHS originale, da non replicare se non necessario).",
+
+  "lis_host": "DA_VERIFICARE",
+  "lis_port": 0,
+
+  "forward_interval_seconds": 10.0,
+  "ack_retry_attempts": 2,
+  "ack_retry_backoff_seconds": 0.5,
+
+  "status_enabled": true,
+  "status_host": "127.0.0.1",
+  "status_port": 8080,
+
+  "api_enabled": true,
+  "api_host": "0.0.0.0",
+  "api_port": 8000,
+
+  "device_offline_timeout_seconds": 300.0,
+
+  "_comment_identita_msh": "sending_app/facility = identita' di questo middleware nei messaggi che genera (ACK, ORU). receiving_app/facility = identita' attesa dal LIS Dedalus in MSH-5/6 dell'ORU — DA_VERIFICARE con chi gestisce il LIS, potrebbe non essere 'CCHS'/'CITIZENCARE' nemmeno nella configurazione attuale del LIS.",
+
+  "sending_app": "HL7MW",
+  "sending_facility": "MIDDLEWARE",
+  "receiving_app": "DA_VERIFICARE",
+  "receiving_facility": "DA_VERIFICARE",
+
+  "_comment_hemoscreen": "Lo strumento fisico (es. HemoScreen) si collega qui indipendentemente da LIS/CCHS — abilitare uno solo tra hl7 e poct1a2 secondo il protocollo supportato dal proprio strumento.",
+
+  "hemoscreen_hl7_enabled": false,
+  "hemoscreen_hl7_host": "0.0.0.0",
+  "hemoscreen_hl7_port": 6663,
+
+  "hemoscreen_poct1a2_enabled": false,
+  "hemoscreen_poct1a2_host": "0.0.0.0",
+  "hemoscreen_poct1a2_port": 6664,
+  "hemoscreen_poct1a2_continuous_mode": false,
+  "hemoscreen_poct1a2_timeout": 65.0,
+
+  "_comment_vpn": "Se il LIS raggiunge oggi CCHS via tunnel VPN site-to-site (spec CCHS §5.1), questo middleware deve trovarsi sull'altro capo dello stesso tunnel (o di uno riconfigurato per puntare qui) — vedi vpn/README.md. Se invece in questo caso il LIS e' raggiungibile in rete locale (topologia diversa da quella prevista dalla spec CCHS), impostare vpn_enabled=false.",
+
+  "vpn_enabled": false,
+  "vpn_provider": "external",
+  "vpn_interface": "",
+  "vpn_config_path": "",
+  "vpn_up_command": "",
+  "vpn_down_command": "",
+  "vpn_manage_lifecycle": false,
+  "vpn_health_check_host": "",
+  "vpn_health_check_port": 0,
+  "vpn_health_check_timeout": 5.0,
+  "vpn_wait_seconds": 20.0,
+  "vpn_poll_interval": 1.0
+}
