@@ -4,6 +4,11 @@
   "order_listen_host": "0.0.0.0",
   "order_listen_port": 6661,
 
+  "_comment_adt_channel": "Opzionale: alcuni LIS (es. Dedalus) aprono due connessioni MLLP separate verso l'EMR Bridge, una per ADT e una per ORM, invece di un unico canale. Se adt_listen_port e' > 0, il middleware apre un secondo listener dedicato (stessa logica di order_listen_port). Lasciare 0 per il comportamento standard a canale unico.",
+
+  "adt_listen_host": "",
+  "adt_listen_port": 0,
+
   "result_listen_host": "0.0.0.0",
   "result_listen_port": 6662,
 

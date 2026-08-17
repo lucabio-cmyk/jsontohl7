@@ -154,6 +154,40 @@ def test_order_receiver_still_rejects_unknown_types():
         print("[5] OrderReceiver: tipi non gestiti (es. SIU) restano rifiutati con AR  OK")
 
 
+def test_dedicated_adt_channel():
+    """Alcuni LIS (es. Dedalus) aprono due connessioni MLLP separate verso
+    l'EMR Bridge, una per ADT e una per ORM, invece di un unico canale.
+    hl7mw.run supporta questo con adt_listen_port: un secondo MllpServer che
+    riusa la stessa OrderReceiver._handle. Qui si replica lo stesso schema
+    manualmente (senza avviare l'intero processo) per verificarlo."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = Store(str(Path(tmpdir) / "test.db"))
+        order_rx = OrderReceiver(store, "127.0.0.1", 0)
+        order_rx._server = mllp.MllpServer("127.0.0.1", 0, order_rx._handle).start()
+        order_port = order_rx._server._srv.server_address[1]
+
+        # secondo listener dedicato ad ADT, stessa logica di gestione
+        adt_server = mllp.MllpServer("127.0.0.1", 0, order_rx._handle).start()
+        adt_port = adt_server._srv.server_address[1]
+
+        try:
+            # ADT arriva sul canale dedicato
+            code = mllp.send_message("127.0.0.1", adt_port, ADT_A04)
+            assert code == "AA", "ADT^A04 sul canale dedicato non ACKato"
+            assert store.get_order("FILLCC01") is None
+
+            # ORM arriva sul canale "ordinario"
+            code = mllp.send_message("127.0.0.1", order_port, ORM)
+            assert code == "AA", "ORM^O01 sul canale ordinario non ACKato"
+            order = store.get_order("FILLCC01")
+            assert order and order["status"] == "RECEIVED"
+        finally:
+            order_rx._server.stop()
+            adt_server.stop()
+
+        print("[6] Canale ADT dedicato + canale ORM ordinario (schema Dedalus) -> entrambi funzionano  OK")
+
+
 def test_vpn_health_check():
     """VpnManager.is_reachable/wait_until_reachable senza avviare alcun tunnel reale
     (provider='external', manage_lifecycle=False): solo verifica di raggiungibilità TCP."""
@@ -197,7 +231,7 @@ def test_vpn_health_check():
     assert mgr3.is_reachable() is True
     assert mgr3.ensure_up() is True
 
-    print("[6] VpnManager: health-check raggiungibilità (down/up/non configurato)  OK")
+    print("[7] VpnManager: health-check raggiungibilità (down/up/non configurato)  OK")
 
 
 def test_vpn_from_config_disabled():
@@ -205,13 +239,14 @@ def test_vpn_from_config_disabled():
     mgr = vpn.from_config({"vpn_enabled": True, "vpn_provider": "wireguard",
                            "vpn_interface": "wg-cchs"})
     assert mgr is not None and mgr.provider == "wireguard" and mgr.interface == "wg-cchs"
-    print("[7] vpn.from_config: rispetta vpn_enabled e legge i parametri  OK")
+    print("[8] vpn.from_config: rispetta vpn_enabled e legge i parametri  OK")
 
 
 if __name__ == "__main__":
     test_parse_adt()
     test_full_flow_replacing_cchs()
     test_order_receiver_still_rejects_unknown_types()
+    test_dedicated_adt_channel()
     test_vpn_health_check()
     test_vpn_from_config_disabled()
     print("\nTUTTI I TEST CITIZENCARE OK")

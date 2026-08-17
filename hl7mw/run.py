@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 from . import hl7
+from . import mllp
 from . import vpn as vpnmod
 from .store import Store
 from .pipeline import OrderReceiver, ResultReceiver, Forwarder
@@ -42,6 +43,13 @@ _STOP = False
 DEFAULTS = {
     "db_path": "hl7mw.db",
     "order_listen_host": "0.0.0.0", "order_listen_port": 6661,
+    # Canale ADT dedicato, opzionale: alcuni LIS (es. Dedalus) aprono due
+    # connessioni MLLP separate verso l'EMR Bridge, una per ADT e una per
+    # ORM, invece di un unico canale. Se adt_listen_port e' impostato (>0),
+    # il middleware apre un secondo listener su questa porta che riusa la
+    # stessa logica di OrderReceiver (ADT^A0x -> ACK, nessun ordine creato);
+    # order_listen_port resta comunque in grado di gestire entrambi i tipi.
+    "adt_listen_host": "", "adt_listen_port": 0,
     "result_listen_host": "0.0.0.0", "result_listen_port": 6662,
     "lis_host": "127.0.0.1", "lis_port": 2575,
     "forward_interval_seconds": 10.0,
@@ -118,6 +126,17 @@ def main(argv=None) -> int:
 
     order_rx = OrderReceiver(store, cfg["order_listen_host"], cfg["order_listen_port"],
                              cfg["sending_app"], cfg["sending_facility"], monitor).start()
+
+    adt_rx_server = None
+    if cfg.get("adt_listen_port"):
+        adt_rx_server = mllp.MllpServer(
+            cfg.get("adt_listen_host") or cfg["order_listen_host"],
+            cfg["adt_listen_port"],
+            order_rx._handle,
+        ).start()
+        LOG.info("Canale ADT dedicato in ascolto su %s:%s (es. LIS con connessioni ADT/ORM separate)",
+                cfg.get("adt_listen_host") or cfg["order_listen_host"], cfg["adt_listen_port"])
+
     result_rx = ResultReceiver(store, cfg["result_listen_host"], cfg["result_listen_port"],
                                cfg["sending_app"], cfg["sending_facility"], monitor).start()
     oru_cfg = hl7.OruConfig(cfg["sending_app"], cfg["sending_facility"],
@@ -193,6 +212,8 @@ def main(argv=None) -> int:
                 slept += 0.5
     finally:
         order_rx.stop()
+        if adt_rx_server:
+            adt_rx_server.stop()
         result_rx.stop()
         if status:
             status.stop()

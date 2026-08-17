@@ -93,6 +93,18 @@ LIS del cliente** (quelli che oggi ha configurati per parlare con CCHS).
 "receiving_app": "LIS", "receiving_facility": "OSP"          // identita' del vero LIS, non di CCHS
 ```
 
+**Alcuni LIS separano ADT e ORM su due connessioni distinte** invece di un
+unico canale — es. Dedalus, che verso l'EMR Bridge CCHS apre due connessioni
+MLLP separate (una etichettata "Dedalus ADT to EMR Bridge", una "Dedalus ORM
+to EMR Bridge", tipicamente su porte diverse). In quel caso impostare anche:
+
+```jsonc
+"adt_listen_host": "", "adt_listen_port": 6000   // stessa porta ADT gia' usata dal LIS verso CCHS
+```
+
+così il LIS non deve essere riconfigurato: `order_listen_port` continua a
+gestire l'ORM (e comunque anche l'ADT, se mai arrivasse lì).
+
 `receiving_app`/`receiving_facility` vanno valorizzati con l'identità
 (MSH-5/MSH-6) che il LIS del cliente si aspetta nell'ORU — da verificare con
 chi gestisce il LIS, non necessariamente uguali a "CCHS"/"CITIZENCARE".

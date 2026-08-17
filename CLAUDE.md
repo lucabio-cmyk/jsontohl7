@@ -13,7 +13,10 @@ Tre flussi (in `hl7mw/pipeline.py`):
 1. `OrderReceiver` — server MLLP, riceve ORM/OML dal LIS, salva l'ordine, risponde ACK.
    Riceve anche ADT^A0x (registrazione paziente, es. quando si sostituisce un
    fornitore cloud come Citizen Care Connect): ACK positivo, nessun ordine
-   creato (vedi `_handle_adt`, `hl7.parse_adt`).
+   creato (vedi `_handle_adt`, `hl7.parse_adt`). Alcuni LIS (es. Dedalus) aprono
+   due connessioni MLLP separate verso l'EMR Bridge, una per ADT e una per ORM,
+   invece di un unico canale: supportato con `adt_listen_port` opzionale in
+   `hl7mw/run.py` (secondo `mllp.MllpServer` che riusa `OrderReceiver._handle`).
 2. `ResultReceiver` — server MLLP, riceve ORU dagli strumenti, **associa** all'ordine.
 3. `Forwarder` — ordini `READY` → ORU^R01 → LIS, gestisce l'ACK.
 

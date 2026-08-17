@@ -854,8 +854,10 @@ def get_dashboard_html() -> str:
             // LIS
             { key: 'lis_host', label: 'LIS — host', type: 'text', section: 'LIS' },
             { key: 'lis_port', label: 'LIS — porta', type: 'number', section: 'LIS' },
-            { key: 'order_listen_host', label: 'Ordini in ingresso — host', type: 'text', section: 'LIS' },
-            { key: 'order_listen_port', label: 'Ordini in ingresso — porta', type: 'number', section: 'LIS' },
+            { key: 'order_listen_host', label: 'Ordini (ADT+ORM) in ingresso — host', type: 'text', section: 'LIS' },
+            { key: 'order_listen_port', label: 'Ordini (ADT+ORM) in ingresso — porta', type: 'number', section: 'LIS' },
+            { key: 'adt_listen_host', label: 'Canale ADT dedicato (opz., vuoto = usa host sopra)', type: 'text', section: 'LIS' },
+            { key: 'adt_listen_port', label: 'Canale ADT dedicato — porta (0 = disabilitato, es. Dedalus)', type: 'number', section: 'LIS' },
             { key: 'sending_app', label: 'Sending App (nostro)', type: 'text', section: 'LIS' },
             { key: 'sending_facility', label: 'Sending Facility (nostro)', type: 'text', section: 'LIS' },
             { key: 'receiving_app', label: 'Receiving App (LIS)', type: 'text', section: 'LIS' },
