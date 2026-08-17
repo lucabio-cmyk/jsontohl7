@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
+
+LOG = logging.getLogger("hl7mw")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -99,6 +102,7 @@ class Store:
         self.path = path
         with self._conn() as c:
             c.executescript(SCHEMA)
+        LOG.info("Store: database SQLite pronto (%s)", path)
 
     @contextmanager
     def _conn(self):
@@ -108,6 +112,14 @@ class Store:
         try:
             yield conn
             conn.commit()
+        except sqlite3.OperationalError as e:
+            # Tipicamente "database is locked" sotto contesa concorrente: il
+            # timeout di 30s sopra dovrebbe evitarlo quasi sempre, ma se
+            # succede va nel log applicativo — altrimenti l'eccezione si
+            # propaga (correttamente) al chiamante ma senza lasciare traccia
+            # di cosa fosse in corso quando e' avvenuto.
+            LOG.error("Store: errore SQLite operativo su %s: %s", self.path, e)
+            raise
         finally:
             conn.close()
 

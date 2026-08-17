@@ -101,7 +101,28 @@ python3 -m hl7mw.cli --db hl7mw.db audit-log [--sample-key S] [--event-type X]
 python3 -m hl7mw.cli --db hl7mw.db instruments
 python3 -m hl7mw.cli --db hl7mw.db stats
 python3 -m hl7mw.cli --db hl7mw.db unmatched
+python3 -m hl7mw.cli logs [--lines 100] [--log-file path]   # non richiede --db
 ```
+
+## Logging
+
+Due tracciati distinti, entrambi sempre attivi:
+
+- **Audit log clinico** (`audit_log` su SQLite): eventi strutturati per la tracciabilità
+  (ordine ricevuto/pronto/inoltrato, cambio stato strumento, direttive HemoScreen, modifiche
+  config/VPN) — `GET /api/audit-log`, `python3 -m hl7mw.cli audit-log`.
+- **Log tecnico applicativo** (`hl7mw/logging_setup.py`): l'intero servizio (MLLP, DB, VPN, API
+  — incluse le eccezioni con stack trace, anche quelle di FastAPI/uvicorn, unificate nello stesso
+  flusso) su **file con rotazione** + console, per diagnosticare un problema senza doverlo
+  riprodurre. Configurabile (`log_level`/`log_file`/`log_max_bytes`/`log_backup_count`/
+  `log_console` in `config.json`, anche dalla GUI Impostazioni → sezione Log); `log_file: ""`
+  disabilita il file e logga solo su console. Consultabile senza accesso SSH/shell:
+  `GET /api/logs?lines=200` (pannello "Log Applicativo" in dashboard) o
+  `python3 -m hl7mw.cli logs`.
+
+Un bug nel gestore di un messaggio MLLP (LIS/strumento) non fa più cadere il servizio né
+sparisce silenziosamente: risponde un ACK di errore generico al mittente e logga l'eccezione
+completa (stack trace) sul file — prima veniva ingoiata senza lasciare traccia.
 
 ## Sostituzione di Citizen Care Connect (CCHS) + VPN
 

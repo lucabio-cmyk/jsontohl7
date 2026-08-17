@@ -11,8 +11,11 @@ Integrato nei Receiver per registrare ogni messaggio.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from .store import Store
+
+LOG = logging.getLogger("hl7mw")
 
 
 class DeviceMonitor:
@@ -25,6 +28,7 @@ class DeviceMonitor:
     def register_instrument(self, name: str, host: str, port: int, type_: str = "POCT") -> None:
         """Registra uno strumento nel database."""
         self.store.upsert_instrument(name, host, port, type_)
+        LOG.info("Strumento registrato: %s (%s:%s, tipo=%s)", name, host, port, type_)
 
     def record_message(self, instrument_name: str, host: str = "", port: int = 0,
                         type_: str = "POCT") -> None:
@@ -38,6 +42,8 @@ class DeviceMonitor:
             return
         if not self.store.get_instrument(instrument_name):
             self.store.upsert_instrument(instrument_name, host, port, type_)
+            LOG.info("Strumento auto-registrato al primo messaggio: %s (%s:%s, tipo=%s)",
+                    instrument_name, host, port, type_)
         self.store.mark_instrument_message(instrument_name)
         self.store.set_instrument_heartbeat(instrument_name, "ONLINE")
 
@@ -71,6 +77,8 @@ class DeviceMonitor:
                     details=f"{current_status} → {new_status}",
                     severity="INFO" if new_status == "ONLINE" else "WARNING",
                 )
+                log_fn = LOG.warning if new_status == "OFFLINE" else LOG.info
+                log_fn("Strumento %s: %s -> %s", instr["name"], current_status, new_status)
 
         return changes
 

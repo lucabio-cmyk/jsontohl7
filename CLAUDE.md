@@ -31,6 +31,13 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
 - Convenzioni: commenti/log in italiano; nomi e docstring chiari; niente librerie esterne
   nel package `hl7mw/` senza prima discuterne (UI e tooling di sviluppo possono usarle).
 - Prima di modificare il parsing HL7, aggiungi un test in `tests/` che riproduce il caso.
+- Logging: ogni modulo usa `LOG = logging.getLogger("hl7mw")` (o logger figli, es.
+  `"hl7mw.xxx"` — propagano allo stesso handler). La configurazione (file rotante + console,
+  livello) è centralizzata in `hl7mw/logging_setup.py:configure_logging()`, chiamata una sola
+  volta in `run.main()`: non richiamare `logging.basicConfig()` altrove. Un'eccezione nel
+  gestore di un messaggio MLLP o in un endpoint API deve sempre finire in log
+  (`LOG.exception`/handler globale in `api.py`) prima di essere trasformata in una risposta di
+  errore al chiamante — mai ingoiata silenziosamente (era un bug reale in `mllp.py`).
 
 ## Nuove Features (v2 — Sistema di Gestione & Monitoring)
 
@@ -57,7 +64,10 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
 - Endpoint `/api/vpn/up` / `/api/vpn/down` (POST) — avvia/ferma il tunnel on-demand (wg-quick/openvpn/
   comando custom, vedi `hl7mw/vpn.py`), solo se `vpn_enabled`+`vpn_manage_lifecycle` nella
   configurazione **salvata** (non nel form non ancora salvato); 400 esplicito altrimenti
-- **Dashboard HTML moderna**: Chart.js (doughnut chart status, metriche KPI, tabelle ordini, azioni, device status)
+- Endpoint `/api/logs` — tail (default 200 righe) del log tecnico applicativo su file
+  (`hl7mw/logging_setup.py`), diverso dall'audit_log clinico — 404 se `log_file` non configurato
+- **Dashboard HTML moderna**: Chart.js (doughnut chart status, metriche KPI, tabelle ordini, azioni,
+  device status), pannello "Log Applicativo" (tail del file di log, refresh manuale)
 
 Abilitazione: `"api_enabled": true` in config, oppure `pip install fastapi uvicorn`
 
@@ -75,14 +85,17 @@ python3 -m hl7mw.cli --db hl7mw.db audit-log [--sample-key S] [--event-type X] [
 python3 -m hl7mw.cli --db hl7mw.db instruments     # elenco device
 python3 -m hl7mw.cli --db hl7mw.db stats           # statistiche globali
 python3 -m hl7mw.cli --db hl7mw.db unmatched       # risultati orfani
+python3 -m hl7mw.cli logs [--lines 100]            # log tecnico (non richiede --db)
 ```
 
 ### Device Monitoring (`monitor.py`)
 - **`DeviceMonitor`** integrato nei Receiver: registra heartbeat ad ogni messaggio
   (auto-registra lo strumento se nuovo — vedi `record_message`)
-- Aggiorna status ONLINE/OFFLINE basato su timeout (config: `device_offline_timeout_seconds`)
+- Aggiorna status ONLINE/OFFLINE basato su timeout (config: `device_offline_timeout_seconds`) —
+  `update_health_status()` richiamato dal loop principale in `run.main()` ad ogni giro
+  (insieme a `forwarder.forward_ready()`), non solo on-demand
 - Traccia msg count per device
-- Audit log per cambio status (INFO online, WARNING offline)
+- Audit log **e** log tecnico per cambio status (INFO online, WARNING offline)
 
 ## Sostituzione Citizen Care Connect (CCHS) + VPN
 

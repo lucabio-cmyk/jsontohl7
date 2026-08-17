@@ -156,6 +156,34 @@ def cmd_unmatched(args, store: Store):
     return 0
 
 
+def cmd_logs(args):
+    """Ultime righe del log applicativo (file rotante, diverso dall'audit-log
+    clinico su DB): non richiede il database, cosi' resta utilizzabile anche
+    per capire perché il servizio non e' partito correttamente."""
+    log_file = args.log_file
+    if not log_file:
+        # Stesso auto-discovery di hl7mw.run.load_config: se un config.json
+        # esiste nella cwd usa il suo log_file, altrimenti il default.
+        cfg_path = Path("config.json")
+        log_file = "hl7mw.log"
+        if cfg_path.exists():
+            try:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                log_file = cfg.get("log_file") or log_file
+            except (OSError, ValueError):
+                pass
+
+    p = Path(log_file)
+    if not p.exists():
+        print(f"File di log non trovato: {p}")
+        return 1
+
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[-args.lines:]:
+        print(line)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="HL7 Middleware CLI — gestione ordini, statistiche, audit"
@@ -205,11 +233,20 @@ def main():
     p_unmatched = subparsers.add_parser("unmatched", help="Risultati orfani")
     p_unmatched.set_defaults(func=cmd_unmatched)
 
+    # logs
+    p_logs = subparsers.add_parser("logs", help="Ultime righe del log applicativo (tecnico, non l'audit clinico)")
+    p_logs.add_argument("--log-file", help="Path del file di log (default: log_file da config.json se presente, altrimenti hl7mw.log)")
+    p_logs.add_argument("--lines", type=int, default=100, help="Numero di righe (default 100)")
+    p_logs.set_defaults(func=cmd_logs)
+
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         return 1
+
+    if args.command == "logs":
+        return cmd_logs(args) or 0
 
     # Carica database
     if not Path(args.db).exists():

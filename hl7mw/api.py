@@ -10,17 +10,20 @@ Rimpiazza webstatus.py con operazioni complete:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .store import Store
 from . import vpn as vpnmod
 from .adapters import hemoscreen_poct1a2 as poct1a2
+
+LOG = logging.getLogger("hl7mw")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -33,6 +36,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def _log_unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    """Ultima rete di sicurezza: qualunque eccezione non gestita esplicitamente
+    da un endpoint (bug, errore DB, ecc.) va comunque nel log applicativo con
+    lo stack trace completo prima di rispondere 500 — altrimenti chi guarda la
+    dashboard vede solo un errore generico, senza nessuna traccia server-side
+    di cosa sia realmente successo."""
+    LOG.exception("API %s %s: eccezione non gestita", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Errore interno del server"})
 
 _store: Store | None = None
 _config_path: str = "config.json"
@@ -111,9 +125,11 @@ async def update_config(payload: dict):
     try:
         p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     except OSError as e:
+        LOG.error("API: scrittura di %s fallita: %s", p, e)
         raise HTTPException(status_code=500, detail=f"Scrittura di {p} fallita: {e}")
     if _store:
         _store.audit_log("config_updated", details=f"{sorted(validated)}", severity="INFO")
+    LOG.info("API: configurazione aggiornata (%s) -> %s", sorted(validated), p)
     return {"status": "ok", "config_path": str(p), "restart_required": True}
 
 
@@ -151,9 +167,11 @@ async def start_vpn():
     try:
         mgr.up()
     except vpnmod.VpnError as e:
+        LOG.error("API: avvio tunnel VPN fallito (provider=%s): %s", mgr.provider, e)
         raise HTTPException(status_code=500, detail=str(e))
     if _store:
         _store.audit_log("vpn_up_triggered", details=f"provider={mgr.provider}", severity="INFO")
+    LOG.info("API: tunnel VPN avviato on-demand (provider=%s)", mgr.provider)
     return {"status": "ok"}
 
 
@@ -165,9 +183,11 @@ async def stop_vpn():
     try:
         mgr.down()
     except vpnmod.VpnError as e:
+        LOG.error("API: arresto tunnel VPN fallito (provider=%s): %s", mgr.provider, e)
         raise HTTPException(status_code=500, detail=str(e))
     if _store:
         _store.audit_log("vpn_down_triggered", details=f"provider={mgr.provider}", severity="INFO")
+    LOG.info("API: tunnel VPN fermato on-demand (provider=%s)", mgr.provider)
     return {"status": "ok"}
 
 
@@ -183,11 +203,23 @@ async def stop_vpn():
 
 def _require_device(device_id: str, ok: bool) -> None:
     if not ok:
+        LOG.warning("API: direttiva HemoScreen richiesta per device non connesso: %s", device_id)
         raise HTTPException(
             status_code=404,
             detail=f"Nessun device POCT1-A2 connesso corrispondente a '{device_id}' "
                    f"in questo momento (strumento spento o non collegato).",
         )
+
+
+def _audit_directive(event_type: str, device_id: str, details: str | None = None,
+                     severity: str = "INFO") -> None:
+    """Traccia una direttiva HemoScreen accodata sia sull'audit clinico (DB,
+    tracciabilita' — vedi store.audit_log) sia sul log tecnico applicativo
+    (file, per il troubleshooting operativo)."""
+    if _store:
+        _store.audit_log(event_type, instrument=device_id, details=details, severity=severity)
+    log_fn = LOG.warning if severity == "WARNING" else LOG.info
+    log_fn("API: %s device=%s%s", event_type, device_id, f" ({details})" if details else "")
 
 
 @app.get("/api/hemoscreen/devices")
@@ -202,8 +234,7 @@ async def hemoscreen_lock(device_id: str):
     """Accoda la direttiva LOCK (DTV.R01): impedisce ulteriori analisi sul device."""
     ok = poct1a2.send_lock(device_id)
     _require_device(device_id, ok)
-    if _store:
-        _store.audit_log("poct1a2_lock_queued", instrument=device_id, severity="WARNING")
+    _audit_directive("poct1a2_lock_queued", device_id, severity="WARNING")
     return {"status": "queued"}
 
 
@@ -212,8 +243,7 @@ async def hemoscreen_unlock(device_id: str):
     """Accoda la direttiva UNLOCK (DTV.R01): ripristina il device dopo un LOCK."""
     ok = poct1a2.send_unlock(device_id)
     _require_device(device_id, ok)
-    if _store:
-        _store.audit_log("poct1a2_unlock_queued", instrument=device_id, severity="INFO")
+    _audit_directive("poct1a2_unlock_queued", device_id)
     return {"status": "queued"}
 
 
@@ -230,8 +260,7 @@ async def hemoscreen_set_time(device_id: str, payload: dict | None = None):
             raise HTTPException(status_code=400, detail="dttm non valido: atteso ISO 8601")
     ok = poct1a2.send_set_time(device_id, dt)
     _require_device(device_id, ok)
-    if _store:
-        _store.audit_log("poct1a2_set_time_queued", instrument=device_id, severity="INFO")
+    _audit_directive("poct1a2_set_time_queued", device_id)
     return {"status": "queued"}
 
 
@@ -244,9 +273,7 @@ async def hemoscreen_operator_list(device_id: str, payload: dict):
         raise HTTPException(status_code=400, detail="Campo 'operators' (lista) obbligatorio")
     ok = poct1a2.send_operator_list(device_id, operators)
     _require_device(device_id, ok)
-    if _store:
-        _store.audit_log("poct1a2_operator_list_queued", instrument=device_id,
-                         details=f"{len(operators)} operatori", severity="INFO")
+    _audit_directive("poct1a2_operator_list_queued", device_id, details=f"{len(operators)} operatori")
     return {"status": "queued"}
 
 
@@ -259,9 +286,8 @@ async def hemoscreen_operator_list_incremental(device_id: str, payload: dict):
         raise HTTPException(status_code=400, detail="Campo 'updates' (lista) obbligatorio")
     ok = poct1a2.send_operator_list_incremental(device_id, updates)
     _require_device(device_id, ok)
-    if _store:
-        _store.audit_log("poct1a2_operator_list_incremental_queued", instrument=device_id,
-                         details=f"{len(updates)} aggiornamenti", severity="INFO")
+    _audit_directive("poct1a2_operator_list_incremental_queued", device_id,
+                     details=f"{len(updates)} aggiornamenti")
     return {"status": "queued"}
 
 
@@ -275,9 +301,7 @@ async def hemoscreen_qc_lot(device_id: str, payload: dict):
     ok = poct1a2.send_qc_lot(device_id, payload["lot_number"], payload["expiration_date"],
                               payload["revision"], payload["levels"])
     _require_device(device_id, ok)
-    if _store:
-        _store.audit_log("poct1a2_qc_lot_queued", instrument=device_id,
-                         details=payload["lot_number"], severity="INFO")
+    _audit_directive("poct1a2_qc_lot_queued", device_id, details=payload["lot_number"])
     return {"status": "queued"}
 
 
@@ -290,8 +314,7 @@ async def hemoscreen_gender_normal_range(device_id: str, payload: dict):
             raise HTTPException(status_code=400, detail=f"Campo '{field}' obbligatorio")
     ok = poct1a2.send_gender_normal_range(device_id, payload["effective_date"], payload["genders"])
     _require_device(device_id, ok)
-    if _store:
-        _store.audit_log("poct1a2_gender_normal_range_queued", instrument=device_id, severity="INFO")
+    _audit_directive("poct1a2_gender_normal_range_queued", device_id)
     return {"status": "queued"}
 
 
@@ -302,8 +325,7 @@ async def hemoscreen_device_setup(device_id: str, payload: dict):
     hl7mw/adapters/hemoscreen_poct1a2.py:build_dtv_pix_dvcset per la struttura attesa."""
     ok = poct1a2.send_device_setup(device_id, payload)
     _require_device(device_id, ok)
-    if _store:
-        _store.audit_log("poct1a2_device_setup_queued", instrument=device_id, severity="INFO")
+    _audit_directive("poct1a2_device_setup_queued", device_id)
     return {"status": "queued"}
 
 
@@ -496,6 +518,32 @@ async def get_audit_log(
 
         rows = c.execute(query, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def _tail_lines(path: Path, n: int) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return "\n".join(text.splitlines()[-n:])
+
+
+@app.get("/api/logs")
+async def get_logs(lines: int = Query(200, ge=1, le=5000)):
+    """Ultime righe del log applicativo (file rotante, vedi hl7mw/logging_setup.py
+    e config log_file/log_level) — pensato per diagnosticare un problema dalla
+    dashboard senza bisogno di accesso SSH/shell alla macchina che esegue il
+    middleware. Diverso da /api/audit-log: quello e' la tracciabilita' clinica
+    (eventi strutturati su DB), questo e' il log tecnico dell'intero servizio
+    (MLLP, DB, VPN, API, incluse le eccezioni con stack trace)."""
+    log_file = _read_config().get("log_file") or ""
+    if not log_file:
+        raise HTTPException(status_code=404, detail="Nessun file di log configurato (log_file vuoto in config)")
+    p = Path(log_file)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"File di log non trovato: {p}")
+    try:
+        content = _tail_lines(p, lines)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Lettura di {p} fallita: {e}")
+    return PlainTextResponse(content)
 
 
 @app.get("/")
@@ -783,6 +831,21 @@ def get_dashboard_html() -> str:
             </table>
             <div class="last-update">Aggiornamento automatico ogni 5s</div>
         </div>
+
+        <!-- Log applicativo -->
+        <div class="table-container">
+            <h3>Log Applicativo
+                <button class="action-button" onclick="loadLogs()"
+                        style="margin-left:10px;font-size:12px;padding:4px 10px;">↻ Aggiorna</button>
+            </h3>
+            <pre id="logContent" style="max-height:400px;overflow:auto;background:#1a1a2e;color:#d4d4d4;
+                 padding:12px;border-radius:6px;font-size:12px;line-height:1.4;white-space:pre-wrap;
+                 word-break:break-all;">Caricamento…</pre>
+            <div class="last-update">
+                Ultime 200 righe del log tecnico del servizio (MLLP, DB, VPN, API — non l'audit clinico).
+                Non aggiornato automaticamente: usa "Aggiorna".
+            </div>
+        </div>
     </div>
 
     <!-- Order Detail Modal -->
@@ -1038,6 +1101,13 @@ def get_dashboard_html() -> str:
             { key: 'api_enabled', label: 'Dashboard REST abilitata', type: 'checkbox', section: 'Servizio' },
             { key: 'api_host', label: 'Dashboard — host', type: 'text', section: 'Servizio' },
             { key: 'api_port', label: 'Dashboard — porta', type: 'number', section: 'Servizio' },
+
+            { key: 'log_level', label: 'Log — livello', type: 'select',
+              options: ['DEBUG', 'INFO', 'WARNING', 'ERROR'], section: 'Log' },
+            { key: 'log_file', label: 'Log — file (vuoto = solo console)', type: 'text', section: 'Log' },
+            { key: 'log_max_bytes', label: 'Log — dimensione max file (byte)', type: 'number', section: 'Log' },
+            { key: 'log_backup_count', label: 'Log — quante rotazioni mantenere', type: 'number', section: 'Log' },
+            { key: 'log_console', label: 'Log anche su console', type: 'checkbox', section: 'Log' },
         ];
 
         async function openSettings() {
@@ -1176,9 +1246,26 @@ def get_dashboard_html() -> str:
             }
         }
 
+        async function loadLogs() {
+            const el = document.getElementById('logContent');
+            try {
+                const r = await fetch('/api/logs?lines=200');
+                if (!r.ok) {
+                    const d = await r.json().catch(() => ({}));
+                    el.textContent = `[log non disponibile: ${d.detail || r.status}]`;
+                    return;
+                }
+                el.textContent = (await r.text()) || '[file di log vuoto]';
+                el.scrollTop = el.scrollHeight;
+            } catch (e) {
+                el.textContent = `[errore di rete caricando il log: ${e}]`;
+            }
+        }
+
         // Initial load and auto-refresh
         updateDashboard();
         setInterval(updateDashboard, 5000);
+        loadLogs();
     </script>
 </body>
 </html>"""

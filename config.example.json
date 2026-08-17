@@ -1,6 +1,14 @@
 {
   "db_path": "hl7mw.db",
 
+  "_comment_log": "Log tecnico del servizio (diverso dall'audit_log clinico su DB): file rotante + console. log_file vuoto = solo console. Consultabile anche da GET /api/logs (dashboard) o 'python3 -m hl7mw.cli logs'.",
+
+  "log_level": "INFO",
+  "log_file": "hl7mw.log",
+  "log_max_bytes": 10485760,
+  "log_backup_count": 5,
+  "log_console": true,
+
   "order_listen_host": "0.0.0.0",
   "order_listen_port": 6661,
 

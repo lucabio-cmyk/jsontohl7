@@ -23,6 +23,7 @@ from pathlib import Path
 from . import hl7
 from . import mllp
 from . import vpn as vpnmod
+from .logging_setup import configure_logging
 from .store import Store
 from .pipeline import OrderReceiver, ResultReceiver, Forwarder
 from .monitor import DeviceMonitor
@@ -42,6 +43,15 @@ _STOP = False
 
 DEFAULTS = {
     "db_path": "hl7mw.db",
+    # Log applicativo (diverso dall'audit_log clinico su DB, vedi store.py):
+    # traccia tecnica di tutto il servizio (MLLP, DB, VPN, API) su file
+    # rotante + console, per diagnosticare problemi senza dover riprodurli.
+    # log_file="" disabilita il file e logga solo su console.
+    "log_level": "INFO",
+    "log_file": "hl7mw.log",
+    "log_max_bytes": 10 * 1024 * 1024,
+    "log_backup_count": 5,
+    "log_console": True,
     "order_listen_host": "0.0.0.0", "order_listen_port": 6661,
     # Canale ADT dedicato, opzionale: alcuni LIS (es. Dedalus) aprono due
     # connessioni MLLP separate verso l'EMR Bridge, una per ADT e una per
@@ -115,12 +125,19 @@ def resolve_vpn_health_check(cfg: dict) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Middleware HL7v2 order-driven.")
     ap.add_argument("-c", "--config")
-    ap.add_argument("--loglevel", default="INFO")
+    ap.add_argument("--loglevel", default=None,
+                    help="Sovrascrive log_level della configurazione (DEBUG/INFO/WARNING/ERROR)")
     args = ap.parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.loglevel.upper(), logging.INFO),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(args.config)
     config_path = args.config or "config.json"
+
+    configure_logging(
+        level=args.loglevel or cfg.get("log_level", "INFO"),
+        log_file=cfg.get("log_file", ""),
+        max_bytes=cfg.get("log_max_bytes", 10 * 1024 * 1024),
+        backup_count=cfg.get("log_backup_count", 5),
+        console=cfg.get("log_console", True),
+    )
 
     store = Store(cfg["db_path"])
     monitor = DeviceMonitor(store, cfg.get("device_offline_timeout_seconds", 300.0))
@@ -168,7 +185,14 @@ def main(argv=None) -> int:
                 host=cfg.get("api_host", "0.0.0.0"),
                 port=cfg.get("api_port", 8000),
                 log_level="info",
-                access_log=False,
+                access_log=True,
+                # log_config=None: non applicare la configurazione di logging
+                # separata di uvicorn (che per default non propaga al logger
+                # radice) - cosi' anche i log di uvicorn/FastAPI (incluso
+                # l'access log di ogni richiesta) finiscono nello stesso
+                # file/console configurati da configure_logging(), invece di
+                # un flusso separato invisibile a chi legge hl7mw.log.
+                log_config=None,
                 # Espliciti (non "auto"): "auto" risolve l'implementazione via
                 # importlib a runtime, invisibile all'analisi statica di PyInstaller
                 # nell'eseguibile Windows (vedi packaging/win/). h11/asyncio sono
@@ -215,6 +239,15 @@ def main(argv=None) -> int:
                 forwarder.forward_ready()
             except Exception:
                 LOG.exception("Errore nel loop di inoltro; continuo.")
+            try:
+                # Rileva strumenti andati OFFLINE (nessun messaggio da oltre
+                # device_offline_timeout_seconds): senza questa chiamata
+                # periodica lo status resta ONLINE per sempre dopo il primo
+                # messaggio, e la dashboard non segnalerebbe mai uno strumento
+                # spento/scollegato.
+                monitor.update_health_status()
+            except Exception:
+                LOG.exception("Errore nel controllo health strumenti; continuo.")
             slept = 0.0
             while slept < cfg["forward_interval_seconds"] and not _STOP:
                 time.sleep(0.5)
