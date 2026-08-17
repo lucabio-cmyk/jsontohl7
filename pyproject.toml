@@ -20,3 +20,8 @@ hl7mw = "hl7mw.run:main"
 
 [tool.setuptools]
 packages = ["hl7mw"]
+
+[tool.setuptools.package-data]
+# Chart.js vendorizzato per la dashboard (hl7mw/api.py): niente CDN esterno,
+# vedi hl7mw/static/README.md
+hl7mw = ["static/*.js"]

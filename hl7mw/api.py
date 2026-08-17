@@ -10,6 +10,7 @@ Rimpiazza webstatus.py con operazioni complete:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -18,6 +19,8 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .store import Store
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="HL7 Middleware API", version="1.0.0")
 
@@ -241,6 +244,14 @@ async def get_ui():
     return HTMLResponse(get_dashboard_html())
 
 
+@app.get("/static/chart.min.js")
+async def get_chart_js():
+    """Chart.js vendorizzato localmente (vedi hl7mw/static/): la dashboard non
+    deve dipendere da un CDN esterno raggiungibile — reti cliniche/di laboratorio
+    spesso bloccano l'accesso a internet per policy."""
+    return FileResponse(STATIC_DIR / "chart.umd.min.js", media_type="application/javascript")
+
+
 def get_dashboard_html() -> str:
     """HTML della dashboard con statsatistiche e gestione ordini."""
     return """<!DOCTYPE html>
@@ -249,7 +260,7 @@ def get_dashboard_html() -> str:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HL7 Middleware Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="/static/chart.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -484,7 +495,9 @@ def get_dashboard_html() -> str:
                 const statsResp = await fetch('/api/dashboard');
                 const stats = await statsResp.json();
                 renderStats(stats);
-                renderStatusChart(stats);
+                // Il grafico non deve poter bloccare il resto della dashboard
+                // (es. Chart.js non caricato): errori qui restano isolati.
+                try { renderStatusChart(stats); } catch (e) { console.error('Grafico non disponibile:', e); }
 
                 // Instruments
                 const instrResp = await fetch('/api/instruments');
@@ -597,7 +610,7 @@ def get_dashboard_html() -> str:
         }
 
         async function retryOrder(sampleKey) {
-            if (!confirm('Riprovare l\'inoltro di questo ordine?')) return;
+            if (!confirm("Riprovare l'inoltro di questo ordine?")) return;
             const resp = await fetch(`/api/orders/${sampleKey}/retry`, { method: 'POST' });
             if (resp.ok) {
                 alert('Ordine rimesso in coda per retry');

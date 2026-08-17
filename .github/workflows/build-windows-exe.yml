@@ -21,7 +21,9 @@ jobs:
 
       - name: Build eseguibile
         run: |
-          pyinstaller --onefile --name hl7mw-middleware --clean packaging/win/hl7mw_entry.py
+          pyinstaller --onefile --name hl7mw-middleware --clean `
+            --add-data "hl7mw/static/chart.umd.min.js;hl7mw/static" `
+            packaging/win/hl7mw_entry.py
 
       - name: Smoke test (avvio + --help)
         run: |
