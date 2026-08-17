@@ -16,6 +16,12 @@ installato sull'host (vedi `hl7mw/vpn.py`), e nella modalità consigliata si
 limita a verificare che il tunnel sia su, lasciando la gestione del tunnel a
 systemd o a un'appliance di rete.
 
+> **Tunnel già esistente/attivo?** Saltare le sezioni 2-3 (configurazione del
+> tunnel): serve solo la sezione 4, impostando `vpn_provider: "external"` e
+> `vpn_manage_lifecycle: false` (già i default) — il middleware si limita a
+> verificare che l'endpoint del LIS sia raggiungibile attraverso il tunnel che
+> già hai, senza toccarlo.
+
 ## 1. Dati da raccogliere per la sostituzione
 
 Non da CCHS (che stiamo sostituendo), ma da chi gestisce il LIS/la rete del

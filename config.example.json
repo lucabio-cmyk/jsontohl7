@@ -42,12 +42,12 @@
   "hemoscreen_poct1a2_continuous_mode": false,
   "hemoscreen_poct1a2_timeout": 65.0,
 
-  "_comment_vpn": "Tunnel VPN site-to-site verso il LIS. Se si sostituisce un fornitore cloud come CCHS, e' lo stesso tunnel che il LIS origina gia' verso di loro (spec CCHS SS5.1), ripuntato qui. Con vpn_manage_lifecycle=false (consigliato) il middleware fa solo l'health-check su vpn_health_check_host/port (default: lis_host/lis_port); il tunnel va portato su a livello di sistema (vedi vpn/README.md).",
+  "_comment_vpn": "Tunnel VPN site-to-site verso il LIS. CASO PIU' COMUNE (tunnel gia' esistente/gestito fuori dal middleware, es. systemd o appliance di rete): lasciare vpn_provider='external' e vpn_manage_lifecycle=false come sotto, il middleware fa solo l'health-check di raggiungibilita' su vpn_health_check_host/port (default se vuoti: lis_host/lis_port). Se invece si vuole che sia IL MIDDLEWARE ad avviare/fermare il tunnel (es. non c'e' systemd), impostare vpn_manage_lifecycle=true, vpn_provider='wireguard'|'openvpn' e vpn_interface/vpn_config_path — vedi vpn/README.md e i template in vpn/*.conf.example.",
 
   "vpn_enabled": false,
-  "vpn_provider": "wireguard",
-  "vpn_interface": "wg-cchs",
-  "vpn_config_path": "/etc/wireguard/wg-cchs.conf",
+  "vpn_provider": "external",
+  "vpn_interface": "",
+  "vpn_config_path": "",
   "vpn_up_command": "",
   "vpn_down_command": "",
   "vpn_manage_lifecycle": false,
