@@ -51,6 +51,17 @@ Il core (`hl7mw/`) resta a **zero dipendenze esterne**: se FastAPI/uvicorn non s
 installati, il servizio parte comunque — l'API viene semplicemente disabilitata con un
 warning nei log, e restano attivi ordini/risultati/inoltro + Stato UI minimale.
 
+## Configurazione da GUI
+
+La dashboard (`http://host:8000/`) ha un pulsante **⚙ Impostazioni** che apre un
+form per l'intera configurazione — LIS, strumenti (HemoScreen), VPN, rete/servizio
+— con validazione (chiavi/tipi) e un pulsante **Verifica tunnel** che testa la
+raggiungibilità VPN in tempo reale (`GET /api/vpn/check`), senza dover salvare
+prima. Il salvataggio scrive su `config.json` (`GET`/`PUT /api/config`): **non è
+applicato a runtime** — LIS, VPN e adapter strumenti sono inizializzati una sola
+volta all'avvio, quindi serve riavviare il servizio perché le modifiche abbiano
+effetto (la dashboard lo segnala esplicitamente dopo il salvataggio).
+
 ## Eseguibile Windows (.exe)
 
 Per far girare il middleware su una macchina Windows senza Python installato:
@@ -123,6 +134,7 @@ python3 tests/test_management_system.py # API/store v2: dashboard, retry, audit,
 python3 tests/test_ack_retry_backoff.py # retry/backoff su ACK del LIS
 python3 tests/test_hemoscreen.py        # adapter strumento HemoScreen (HL7 e POCT1-A2)
 python3 tests/test_citizencare.py       # sostituzione CCHS: ADT^A04 + ORM^O01 -> ORU^R01 verso il vero LIS + modulo VPN
+python3 tests/test_config_api.py        # pagina Impostazioni: GET/PUT /api/config, GET /api/vpn/check
 ```
 
 ## Stato attuale e prossimi passi
@@ -131,8 +143,10 @@ Funzionante e testato: ricezione ordini (ORM/OML + ADT^A0x di registrazione
 paziente), ricezione/associazione risultati, inoltro al LIS con ACK (inclusi
 retry automatici su errori transitori), gestione risultati orfani, device
 monitoring con heartbeat/status, audit log clinico, REST API + dashboard web
-(Chart.js), CLI operativa completa, VPN configurabile per sostituire fornitori
-cloud come Citizen Care Connect (CCHS) senza toccare il LIS del cliente.
+(Chart.js) con pagina Impostazioni per l'intera configurazione (LIS, strumenti,
+VPN) e verifica tunnel in tempo reale, CLI operativa completa, VPN configurabile
+per sostituire fornitori cloud come Citizen Care Connect (CCHS) senza toccare
+il LIS del cliente.
 
 Da sviluppare (vedi `ARCHITECTURE.md` → Roadmap e `CLAUDE.md` → "Da fare"): adapter
 **ASTM E1381/E1394** per strumenti non-HL7 generici, regola di completezza reale basata

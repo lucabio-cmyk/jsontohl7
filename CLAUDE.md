@@ -46,6 +46,11 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
 - Endpoint `/api/instruments` — status tutti device
 - Endpoint `/api/unmatched` — risultati orfani + `/match` per riconciliazione manuale
 - Endpoint `/api/audit-log` — log tracciabilità (filtri per sample/event)
+- Endpoint `/api/config` (GET/PUT) — configurazione completa (LIS/strumenti/VPN/servizio) per
+  la pagina Impostazioni della dashboard; scrive su `config.json`, **non applicata a runtime**
+  (componenti inizializzati all'avvio, serve riavvio) — validazione chiavi/tipi contro
+  `run.DEFAULTS` in `api._validate_config_update`
+- Endpoint `/api/vpn/check` — health-check on-demand host:porta (bottone "Verifica tunnel")
 - **Dashboard HTML moderna**: Chart.js (doughnut chart status, metriche KPI, tabelle ordini, azioni, device status)
 
 Abilitazione: `"api_enabled": true` in config, oppure `pip install fastapi uvicorn`

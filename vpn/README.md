@@ -76,7 +76,11 @@ Bidirezionale, ristretto agli IP/porte concordati, attraverso il tunnel:
 ## 4. Collegare il middleware
 
 In `config.json` (vedi `config.example.json`): `lis_host`/`lis_port` sono gli
-endpoint del **vero LIS**, non di CCHS.
+endpoint del **vero LIS**, non di CCHS. In alternativa a modificare il file a
+mano, la dashboard (`http://host:8000/`) ha una pagina **⚙ Impostazioni** con
+questi stessi campi e un pulsante **Verifica tunnel** che testa la
+raggiungibilità in tempo reale prima ancora di salvare — il salvataggio scrive
+comunque su `config.json` e richiede un riavvio del servizio per avere effetto.
 
 ```jsonc
 "lis_host": "10.9.0.10",   // IP del LIS lato tunnel

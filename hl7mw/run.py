@@ -78,6 +78,10 @@ DEFAULTS = {
 
 def load_config(path: str | None) -> dict:
     cfg = dict(DEFAULTS)
+    if not path and Path("config.json").exists():
+        # Auto-discovery: se non passato -c, ma un config.json esiste nella
+        # cwd (es. salvato dalla GUI Impostazioni al giro precedente), usalo.
+        path = "config.json"
     if path:
         cfg.update(json.loads(Path(path).read_text(encoding="utf-8")))
     return cfg
@@ -96,6 +100,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(args.config)
+    config_path = args.config or "config.json"
 
     store = Store(cfg["db_path"])
     monitor = DeviceMonitor(store, cfg.get("device_offline_timeout_seconds", 300.0))
@@ -129,7 +134,7 @@ def main(argv=None) -> int:
     api_thread = None
     if cfg.get("api_enabled") and FASTAPI_AVAILABLE:
         import threading
-        app = init_api(store)
+        app = init_api(store, config_path, DEFAULTS)
 
         def run_api():
             uvicorn.run(
