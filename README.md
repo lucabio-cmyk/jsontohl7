@@ -54,17 +54,24 @@ warning nei log, e restano attivi ordini/risultati/inoltro + Stato UI minimale.
 
 ## Configurazione da GUI
 
-La dashboard (`http://host:8000/`) ha un pulsante **⚙ Impostazioni** che apre un
-form per l'intera configurazione — LIS, strumenti (HemoScreen), VPN, rete/servizio
-— con validazione (chiavi/tipi), un pulsante **Verifica tunnel** che testa la
-raggiungibilità VPN in tempo reale (`GET /api/vpn/check`) senza dover salvare
-prima, e — se `vpn_manage_lifecycle: true` — **Avvia tunnel**/**Ferma tunnel**
-per avviarlo/fermarlo on-demand (`POST /api/vpn/up`/`/down`, agiscono sulla
-configurazione già salvata, non sul form). Il salvataggio scrive su
-`config.json` (`GET`/`PUT /api/config`): **non è applicato a runtime** — LIS,
-VPN e adapter strumenti sono inizializzati una sola volta all'avvio, quindi
-serve riavviare il servizio perché le modifiche abbiano effetto (la dashboard
-lo segnala esplicitamente dopo il salvataggio).
+Tutta la configurazione si fa dalla dashboard, senza mai passare da terminale
+o modificare `config.json` a mano — anche al primissimo avvio: se non esiste
+ancora un `config.json`, il servizio parte comunque con i valori di default e,
+appena la dashboard risponde, **apre automaticamente il browser** sulla pagina
+Impostazioni (`open_browser_on_start`, disattivabile per deployment headless).
+
+Il pulsante **⚙ Impostazioni** apre un form per l'intera configurazione — LIS,
+strumenti (HemoScreen), VPN, Log, rete/servizio — con validazione (chiavi/tipi),
+un pulsante **Verifica tunnel** che testa la raggiungibilità VPN in tempo reale
+(`GET /api/vpn/check`) senza dover salvare prima, e — se `vpn_manage_lifecycle:
+true` — **Avvia tunnel**/**Ferma tunnel** per avviarlo/fermarlo on-demand
+(`POST /api/vpn/up`/`/down`, agiscono sulla configurazione già salvata, non sul
+form). Il salvataggio scrive su `config.json` (`GET`/`PUT /api/config`): **non
+è applicato a runtime** — LIS, VPN e adapter strumenti sono inizializzati una
+sola volta all'avvio — ma il pulsante **"Salva e riavvia"** applica le
+modifiche subito, riavviando il processo stesso (`POST /api/restart`, shutdown
+pulito + nuova istanza) senza bisogno di terminale/Task Manager: la pagina
+si ricarica da sola dopo pochi secondi.
 
 ## Eseguibile Windows (.exe)
 
@@ -77,12 +84,16 @@ runner Windows reale.
 1. Dalla scheda **Actions** del repo → *Build Windows exe* → **Run workflow**.
 2. A fine build (qualche minuto), scaricare l'artifact `hl7mw-middleware-windows`
    (contiene `hl7mw-middleware.exe` + `config.example.json`).
-3. Sulla macchina Windows: rinominare `config.example.json` in `config.json`,
-   adattare host/porte del LIS, poi:
+3. Sulla macchina Windows: **doppio click su `hl7mw-middleware.exe`**, senza
+   argomenti né config.json — parte con i default (`hl7mw/run.py` → `DEFAULTS`)
+   e apre da solo il browser sulla pagina Impostazioni: da lì si configura
+   tutto (LIS, strumenti, VPN, rete) e si applica con **"Salva e riavvia"**,
+   senza mai passare dalla riga di comando. `-c config.json` resta disponibile
+   per chi preferisce partire da un file preconfigurato (es. `config.example.json`
+   rinominato, o `config.dedalus-cchs.example.json`):
    ```powershell
    .\hl7mw-middleware.exe -c config.json
    ```
-   (avviabile anche senza `-c`: usa i default in `hl7mw/run.py` → `DEFAULTS`).
 
 Per una build locale (es. su una macchina Windows con Python già installato):
 ```powershell
@@ -192,6 +203,8 @@ python3 tests/test_ack_retry_backoff.py # retry/backoff su ACK del LIS
 python3 tests/test_hemoscreen.py        # adapter strumento HemoScreen (HL7 e POCT1-A2)
 python3 tests/test_citizencare.py       # sostituzione CCHS: ADT^A04 + ORM^O01 -> ORU^R01 verso il vero LIS + modulo VPN
 python3 tests/test_config_api.py        # pagina Impostazioni: GET/PUT /api/config, avvio/arresto/verifica VPN
+python3 tests/test_logging.py           # log applicativo: file rotante, eccezioni MLLP, /api/logs, CLI logs
+python3 tests/test_service_control.py   # configurazione "tutto da GUI": apertura browser, riavvio via API (end-to-end)
 ```
 
 ## Stato attuale e prossimi passi

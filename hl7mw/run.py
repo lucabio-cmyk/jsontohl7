@@ -16,8 +16,13 @@ import argparse
 import json
 import logging
 import signal
+import subprocess
 import sys
+import threading
 import time
+import urllib.error
+import urllib.request
+import webbrowser
 from pathlib import Path
 
 from . import hl7
@@ -39,7 +44,27 @@ except ImportError:
     FASTAPI_AVAILABLE = False
 
 LOG = logging.getLogger("hl7mw")
-_STOP = False
+
+
+class ServiceControl:
+    """Punto di coordinamento tra il loop principale e l'API REST per fermare
+    o riavviare il servizio su richiesta della GUI (pagina Impostazioni) —
+    senza questo, l'unico modo per applicare una modifica di configurazione
+    era chiudere e riavviare manualmente il processo da terminale/Task
+    Manager, in contrasto con l'obiettivo di configurazione interamente da
+    GUI (specialmente per l'eseguibile Windows lanciato con un doppio click,
+    dove l'operatore potrebbe non avere familiarita' con la riga di comando)."""
+
+    def __init__(self):
+        self.stop_event = threading.Event()
+        self.restart_requested = False
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
+
+    def request_restart(self) -> None:
+        self.restart_requested = True
+        self.stop_event.set()
 
 DEFAULTS = {
     "db_path": "hl7mw.db",
@@ -67,6 +92,12 @@ DEFAULTS = {
     "ack_retry_backoff_seconds": 0.5,
     "status_host": "127.0.0.1", "status_port": 8080, "status_enabled": True,
     "api_enabled": True, "api_host": "0.0.0.0", "api_port": 8000,
+    # Apre automaticamente il browser sulla dashboard all'avvio (se l'API e'
+    # attiva): l'obiettivo e' che l'intera configurazione sia raggiungibile
+    # da GUI senza dover conoscere URL/porta a memoria, specialmente per
+    # l'eseguibile Windows lanciato con un doppio click. Disabilitare per
+    # deployment headless (server/systemd) dove non c'e' un browser locale.
+    "open_browser_on_start": True,
     "sending_app": "HL7MW", "sending_facility": "MIDDLEWARE",
     "receiving_app": "LIS", "receiving_facility": "OSP",
     "device_offline_timeout_seconds": 300.0,
@@ -105,9 +136,54 @@ def load_config(path: str | None) -> dict:
     return cfg
 
 
-def _sig(_s, _f):
-    global _STOP
-    _STOP = True
+def _relaunch_command(config_path: str, loglevel: str | None) -> list[str]:
+    """Ricostruisce il comando per rilanciare il servizio dopo un riavvio
+    richiesto da GUI. Quando 'congelato' da PyInstaller, sys.executable punta
+    gia' all'eseguibile stesso (non serve '-m hl7mw.run')."""
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable]
+    else:
+        cmd = [sys.executable, "-m", "hl7mw.run"]
+    cmd += ["-c", config_path]
+    if loglevel:
+        cmd += ["--loglevel", loglevel]
+    return cmd
+
+
+def _maybe_open_browser(cfg: dict) -> None:
+    """Se abilitato e l'API e' attiva, apre il browser di sistema sulla
+    dashboard non appena risponde (poll su /health, max 10s) — in un thread
+    separato per non bloccare l'avvio degli altri componenti. Fallisce in
+    modo silenzioso (solo log) su ambienti headless senza browser."""
+    if not cfg.get("open_browser_on_start", True):
+        return
+    if not (cfg.get("api_enabled") and FASTAPI_AVAILABLE):
+        return
+    port = cfg.get("api_port", 8000)
+    url = f"http://127.0.0.1:{port}/"
+
+    def _wait_and_open():
+        deadline = time.monotonic() + 10.0
+        reachable = False
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1.0) as r:
+                    if r.status == 200:
+                        reachable = True
+                        break
+            except (urllib.error.URLError, OSError):
+                pass
+            time.sleep(0.3)
+        if not reachable:
+            LOG.debug("Dashboard non raggiungibile entro 10s: apertura automatica del browser saltata.")
+            return
+        try:
+            webbrowser.open(url)
+            LOG.info("Dashboard aperta automaticamente nel browser (%s).", url)
+        except Exception as e:
+            LOG.debug("Apertura automatica del browser non riuscita (%s): apri manualmente %s", e, url)
+
+    threading.Thread(target=_wait_and_open, daemon=True, name="open-browser").start()
 
 
 def resolve_vpn_health_check(cfg: dict) -> None:
@@ -138,6 +214,8 @@ def main(argv=None) -> int:
         backup_count=cfg.get("log_backup_count", 5),
         console=cfg.get("log_console", True),
     )
+
+    control = ServiceControl()
 
     store = Store(cfg["db_path"])
     monitor = DeviceMonitor(store, cfg.get("device_offline_timeout_seconds", 300.0))
@@ -175,35 +253,39 @@ def main(argv=None) -> int:
         LOG.info("Status UI su http://%s:%s", cfg["status_host"], cfg["status_port"])
 
     api_thread = None
+    uvicorn_server = None
     if cfg.get("api_enabled") and FASTAPI_AVAILABLE:
-        import threading
-        app = init_api(store, config_path, DEFAULTS)
+        app = init_api(store, config_path, DEFAULTS, control)
 
-        def run_api():
-            uvicorn.run(
-                app,
-                host=cfg.get("api_host", "0.0.0.0"),
-                port=cfg.get("api_port", 8000),
-                log_level="info",
-                access_log=True,
-                # log_config=None: non applicare la configurazione di logging
-                # separata di uvicorn (che per default non propaga al logger
-                # radice) - cosi' anche i log di uvicorn/FastAPI (incluso
-                # l'access log di ogni richiesta) finiscono nello stesso
-                # file/console configurati da configure_logging(), invece di
-                # un flusso separato invisibile a chi legge hl7mw.log.
-                log_config=None,
-                # Espliciti (non "auto"): "auto" risolve l'implementazione via
-                # importlib a runtime, invisibile all'analisi statica di PyInstaller
-                # nell'eseguibile Windows (vedi packaging/win/). h11/asyncio sono
-                # puro Python, portabili senza compilazione; niente websocket:
-                # la dashboard usa solo HTTP/JSON.
-                loop="asyncio", http="h11", ws="none", lifespan="on",
-            )
-
-        api_thread = threading.Thread(target=run_api, daemon=True)
+        uvicorn_config = uvicorn.Config(
+            app,
+            host=cfg.get("api_host", "0.0.0.0"),
+            port=cfg.get("api_port", 8000),
+            log_level="info",
+            access_log=True,
+            # log_config=None: non applicare la configurazione di logging
+            # separata di uvicorn (che per default non propaga al logger
+            # radice) - cosi' anche i log di uvicorn/FastAPI (incluso
+            # l'access log di ogni richiesta) finiscono nello stesso
+            # file/console configurati da configure_logging(), invece di
+            # un flusso separato invisibile a chi legge hl7mw.log.
+            log_config=None,
+            # Espliciti (non "auto"): "auto" risolve l'implementazione via
+            # importlib a runtime, invisibile all'analisi statica di PyInstaller
+            # nell'eseguibile Windows (vedi packaging/win/). h11/asyncio sono
+            # puro Python, portabili senza compilazione; niente websocket:
+            # la dashboard usa solo HTTP/JSON.
+            loop="asyncio", http="h11", ws="none", lifespan="on",
+        )
+        # Server esplicito (non uvicorn.run) per poter chiedere uno shutdown
+        # pulito (should_exit) dal loop principale: necessario perche' un
+        # riavvio richiesto da GUI deve rilasciare davvero le porte prima di
+        # avviare la nuova istanza, non solo terminare il processo di colpo.
+        uvicorn_server = uvicorn.Server(uvicorn_config)
+        api_thread = threading.Thread(target=uvicorn_server.run, daemon=True)
         api_thread.start()
         LOG.info("FastAPI Dashboard su http://%s:%s", cfg.get("api_host", "0.0.0.0"), cfg.get("api_port", 8000))
+        _maybe_open_browser(cfg)
     elif cfg.get("api_enabled") and not FASTAPI_AVAILABLE:
         LOG.warning("API abilitato ma FastAPI non installato (pip install fastapi uvicorn)")
 
@@ -229,12 +311,15 @@ def main(argv=None) -> int:
             monitor=monitor,
         ).start()
 
+    def _sig(_s, _f):
+        control.request_stop()
+
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
     LOG.info("Middleware avviato. Ctrl-C per fermare.")
 
     try:
-        while not _STOP:
+        while not control.stop_event.is_set():
             try:
                 forwarder.forward_ready()
             except Exception:
@@ -249,7 +334,7 @@ def main(argv=None) -> int:
             except Exception:
                 LOG.exception("Errore nel controllo health strumenti; continuo.")
             slept = 0.0
-            while slept < cfg["forward_interval_seconds"] and not _STOP:
+            while slept < cfg["forward_interval_seconds"] and not control.stop_event.is_set():
                 time.sleep(0.5)
                 slept += 0.5
     finally:
@@ -263,12 +348,24 @@ def main(argv=None) -> int:
             hs_hl7.stop()
         if hs_poct:
             hs_poct.stop()
+        if uvicorn_server:
+            uvicorn_server.should_exit = True
+            if api_thread:
+                api_thread.join(timeout=10.0)
         if vpn_manager:
             try:
                 vpn_manager.down()
             except vpnmod.VpnError as e:
                 LOG.warning("VPN: arresto tunnel non riuscito: %s", e)
         LOG.info("Middleware arrestato.")
+
+    if control.restart_requested:
+        try:
+            cmd = _relaunch_command(config_path, args.loglevel)
+            LOG.info("Riavvio richiesto dalla GUI: avvio nuova istanza (%s)", " ".join(cmd))
+            subprocess.Popen(cmd, close_fds=True)
+        except Exception:
+            LOG.exception("Riavvio richiesto ma impossibile avviare la nuova istanza")
     return 0
 
 

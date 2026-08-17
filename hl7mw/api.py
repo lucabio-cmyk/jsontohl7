@@ -51,14 +51,19 @@ async def _log_unhandled_exception(request: Request, exc: Exception) -> JSONResp
 _store: Store | None = None
 _config_path: str = "config.json"
 _config_defaults: dict = {}
+_control = None  # hl7mw.run.ServiceControl — duck-typed per evitare un import circolare
 
-def init_api(store: Store, config_path: str = "config.json", defaults: dict | None = None) -> FastAPI:
-    """Inizializza API con referenza al database e al file di configurazione
-    (per la pagina Impostazioni: GET/PUT /api/config)."""
-    global _store, _config_path, _config_defaults
+def init_api(store: Store, config_path: str = "config.json", defaults: dict | None = None,
+            control=None) -> FastAPI:
+    """Inizializza API con referenza al database, al file di configurazione
+    (per la pagina Impostazioni: GET/PUT /api/config) e opzionalmente al
+    ServiceControl del processo (per POST /api/restart — assente, es. nei
+    test che montano solo l'app FastAPI senza passare da hl7mw.run.main())."""
+    global _store, _config_path, _config_defaults, _control
     _store = store
     _config_path = config_path
     _config_defaults = dict(defaults or {})
+    _control = control
     return app
 
 
@@ -131,6 +136,30 @@ async def update_config(payload: dict):
         _store.audit_log("config_updated", details=f"{sorted(validated)}", severity="INFO")
     LOG.info("API: configurazione aggiornata (%s) -> %s", sorted(validated), p)
     return {"status": "ok", "config_path": str(p), "restart_required": True}
+
+
+@app.post("/api/restart")
+async def restart_service():
+    """Riavvia il processo per applicare la configurazione appena salvata:
+    senza questo endpoint, dopo un salvataggio da GUI l'operatore dovrebbe
+    chiudere e riavviare manualmente il processo da terminale/Task Manager —
+    in contrasto con l'obiettivo di configurazione interamente da GUI,
+    specialmente per l'eseguibile Windows lanciato con un doppio click.
+    Ferma i componenti in modo pulito (incluso il tunnel VPN, se gestito) e
+    avvia una nuova istanza con lo stesso config_path prima di uscire — la
+    risposta arriva PRIMA dello shutdown effettivo, il client deve attendere
+    qualche secondo e poi ricaricare la pagina."""
+    if _control is None:
+        raise HTTPException(
+            status_code=501,
+            detail="Riavvio non supportato in questo contesto di esecuzione "
+                   "(processo non avviato da hl7mw.run.main())",
+        )
+    if _store:
+        _store.audit_log("service_restart_requested", severity="WARNING")
+    LOG.warning("API: riavvio del servizio richiesto dalla GUI")
+    _control.request_restart()
+    return {"status": "restarting"}
 
 
 @app.get("/api/vpn/check")
@@ -864,12 +893,13 @@ def get_dashboard_html() -> str:
             <h2>Impostazioni</h2>
             <div class="settings-note">
                 Le modifiche vengono salvate su <code id="settingsPath"></code> ma non applicate a
-                runtime: LIS, VPN e adapter strumenti sono inizializzati all'avvio — riavvia il
-                servizio dopo il salvataggio perché abbiano effetto.
+                runtime: LIS, VPN e adapter strumenti sono inizializzati all'avvio — premi
+                "Salva e riavvia" perché abbiano effetto, senza bisogno di terminale/Task Manager.
             </div>
             <div id="settingsForm"></div>
             <div class="settings-actions">
-                <button id="saveSettingsBtn" class="action-button" onclick="saveSettings()">Salva</button>
+                <button id="saveSettingsBtn" class="action-button" onclick="saveSettings(false)">Salva</button>
+                <button id="saveRestartBtn" class="action-button" onclick="saveSettings(true)">Salva e riavvia</button>
                 <button class="action-button danger" onclick="closeSettings()">Annulla</button>
             </div>
         </div>
@@ -1101,6 +1131,8 @@ def get_dashboard_html() -> str:
             { key: 'api_enabled', label: 'Dashboard REST abilitata', type: 'checkbox', section: 'Servizio' },
             { key: 'api_host', label: 'Dashboard — host', type: 'text', section: 'Servizio' },
             { key: 'api_port', label: 'Dashboard — porta', type: 'number', section: 'Servizio' },
+            { key: 'open_browser_on_start', label: "Apri automaticamente il browser all'avvio",
+              type: 'checkbox', section: 'Servizio' },
 
             { key: 'log_level', label: 'Log — livello', type: 'select',
               options: ['DEBUG', 'INFO', 'WARNING', 'ERROR'], section: 'Log' },
@@ -1179,20 +1211,36 @@ def get_dashboard_html() -> str:
             return payload;
         }
 
-        async function saveSettings() {
+        async function saveSettings(restart) {
             const payload = collectSettingsPayload();
             const resp = await fetch('/api/config', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
-            if (resp.ok) {
-                alert('Configurazione salvata. Riavvia il servizio per applicare le modifiche.');
-                closeSettings();
-            } else {
+            if (!resp.ok) {
                 const err = await resp.json().catch(() => ({}));
                 alert('Errore: ' + (err.detail || resp.status));
+                return;
             }
+            if (!restart) {
+                alert('Configurazione salvata. Premi "Salva e riavvia" (o riavvia manualmente) per applicare le modifiche.');
+                closeSettings();
+                return;
+            }
+            // Riavvio: nessun terminale/Task Manager necessario. La richiesta
+            // POST /api/restart puo' non ricevere mai una risposta (la
+            // connessione cade insieme al processo che la sta servendo) — non
+            // e' un errore, e' il comportamento atteso.
+            document.getElementById('settingsForm').innerHTML =
+                '<p>Riavvio in corso… la pagina si ricaricherà automaticamente tra pochi secondi.</p>';
+            document.querySelectorAll('#settingsModal .settings-actions button').forEach(b => b.disabled = true);
+            try {
+                await fetch('/api/restart', { method: 'POST' });
+            } catch (e) {
+                // atteso: il processo si ferma prima di poter rispondere
+            }
+            setTimeout(() => { window.location.reload(); }, 6000);
         }
 
         async function checkVpn() {
