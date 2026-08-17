@@ -58,8 +58,15 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
 - Endpoint `/api/audit-log` — log tracciabilità (filtri per sample/event)
 - Endpoint `/api/config` (GET/PUT) — configurazione completa (LIS/strumenti/VPN/servizio) per
   la pagina Impostazioni della dashboard; scrive su `config.json`, **non applicata a runtime**
-  (componenti inizializzati all'avvio, serve riavvio) — validazione chiavi/tipi contro
-  `run.DEFAULTS` in `api._validate_config_update`
+  (componenti inizializzati all'avvio) — validazione chiavi/tipi contro `run.DEFAULTS` in
+  `api._validate_config_update`
+- Endpoint `/api/restart` (POST) — applica le modifiche di config riavviando il processo
+  (bottone "Salva e riavvia"): `run.ServiceControl` coordina shutdown pulito (incl. VPN down,
+  `uvicorn_server.should_exit`) + rilancio (`run._relaunch_command`, `subprocess.Popen`) —
+  niente terminale/Task Manager necessario, importante per l'eseguibile Windows lanciato con
+  un doppio click. 501 se il processo non è stato avviato da `run.main()` (es. test che montano
+  solo l'app FastAPI). All'avvio, se `open_browser_on_start` (default true), `run._maybe_open_browser`
+  apre da solo il browser sulla dashboard non appena `/health` risponde.
 - Endpoint `/api/vpn/check` — health-check on-demand host:porta (bottone "Verifica tunnel")
 - Endpoint `/api/vpn/up` / `/api/vpn/down` (POST) — avvia/ferma il tunnel on-demand (wg-quick/openvpn/
   comando custom, vedi `hl7mw/vpn.py`), solo se `vpn_enabled`+`vpn_manage_lifecycle` nella
