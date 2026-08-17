@@ -418,11 +418,19 @@ class Store:
 
     def purge_processed(self, older_than_hours: float = 72.0) -> int:
         """Sfoltisce la tabella di deduplica: oltre la finestra di ritrasmissione
-        plausibile i control id non servono piu'."""
+        plausibile i control id non servono piu'.
+
+        La finestra si misura sull'ULTIMA attivita' (last_seen), non sulla prima:
+        un mittente che ritrasmette lo stesso messaggio a lungo terrebbe altrimenti
+        una riga "vecchia" secondo first_seen, verrebbe ripulita mentre e' ancora
+        in uso, e la copia successiva rientrerebbe come nuova — duplicando un
+        risultato clinico."""
         cutoff = (_dt.datetime.now() - _dt.timedelta(hours=older_than_hours)).isoformat(
             timespec="seconds")
         with self._conn() as c:
-            cur = c.execute("DELETE FROM processed_messages WHERE first_seen < ?", (cutoff,))
+            cur = c.execute(
+                "DELETE FROM processed_messages WHERE COALESCE(last_seen, first_seen) < ?",
+                (cutoff,))
             return cur.rowcount or 0
 
     def duplicate_messages(self, limit: int = 100) -> list[dict]:

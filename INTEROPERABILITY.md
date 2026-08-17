@@ -46,13 +46,14 @@ dashboard, perché riflette la configurazione e non solo il codice.
 | Risposta batch aggregata (BHS/BTS in uscita) | no |
 | Delimitatori non standard letti da MSH-1/MSH-2 | sì |
 | Retry con backoff sugli errori di trasporto | sì |
+| Tetto alle connessioni simultanee per listener (`mllp_max_connections`) | sì, default 64 |
 | TLS/mTLS sul canale MLLP | no — usare stunnel o VPN (`vpn/README.md`) |
 
 ## Affidabilità
 
 | Funzione | Stato |
 |---|---|
-| Idempotenza sulle ritrasmissioni (MSH-3 + MSH-10 + impronta contenuto) | sì |
+| Idempotenza sulle ritrasmissioni (MSH-3 + MSH-10 + impronta contenuto) | sì, atomica anche fra connessioni concorrenti |
 | Riuso improprio di MSH-10 con contenuto diverso: elaborato + audit | sì |
 | Tracciamento di ogni scambio con esito (`message_log`, `/api/messages`) | sì |
 | Retry/backoff persistente con DLQ nel Forwarder | no (backlog) |

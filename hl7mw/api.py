@@ -584,6 +584,7 @@ async def interop_profile():
             "tls": False,
             "read_timeout_seconds": cfg.get("mllp_read_timeout", 60.0),
             "idle_timeout_seconds": cfg.get("mllp_idle_timeout", 300.0),
+            "max_connections_per_listener": cfg.get("mllp_max_connections", 64),
         },
         "inbound": {
             "orders_port": cfg.get("order_listen_port"),
@@ -1033,6 +1034,23 @@ def get_dashboard_html() -> str:
         let statusChart = null;
         let instrumentChart = null;
 
+        // I valori mostrati arrivano da messaggi HL7 di terzi (sample key, control
+        // id, nome strumento, ...): vanno trattati come testo, mai come markup.
+        // Senza escape un MSH-10 contenente <script> verrebbe eseguito nel browser
+        // dell'operatore ogni volta che apre la dashboard.
+        function esc(value) {
+            if (value === null || value === undefined) return '';
+            return String(value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        // Classe CSS derivata da uno stato: solo lettere, cosi' un valore
+        // inatteso non puo' iniettare altri attributi.
+        function cssClass(value) {
+            return String(value || '').toLowerCase().replace(/[^a-z]/g, '');
+        }
+
         async function updateDashboard() {
             try {
                 // Dashboard stats
@@ -1097,17 +1115,17 @@ def get_dashboard_html() -> str:
             tbody.innerHTML = rows.map(r => {
                 const code = r.ack_code || '-';
                 const cls = positive.includes(code) ? 'success' : (code === '-' ? '' : 'error');
-                const err = r.error_code ? ` <small>(${r.error_code})</small>` : '';
+                const err = r.error_code ? ` <small>(${esc(r.error_code)})</small>` : '';
                 const dup = r.duplicate ? ' <span class="badge">dup</span>' : '';
                 return `<tr>
-                    <td>${(r.timestamp || '').replace('T', ' ')}</td>
-                    <td>${r.direction}</td>
-                    <td>${r.channel || '-'}</td>
-                    <td>${r.message_type || '-'}</td>
-                    <td>${r.control_id || '-'}</td>
-                    <td>${r.sample_key || '-'}</td>
-                    <td class="${cls}">${code}${err}${dup}</td>
-                    <td>${r.elapsed_ms != null ? r.elapsed_ms : '-'}</td>
+                    <td>${esc((r.timestamp || '').replace('T', ' '))}</td>
+                    <td>${esc(r.direction)}</td>
+                    <td>${esc(r.channel || '-')}</td>
+                    <td>${esc(r.message_type || '-')}</td>
+                    <td>${esc(r.control_id || '-')}</td>
+                    <td>${esc(r.sample_key || '-')}</td>
+                    <td class="${cls}">${esc(code)}${err}${dup}</td>
+                    <td>${esc(r.elapsed_ms != null ? r.elapsed_ms : '-')}</td>
                 </tr>`;
             }).join('');
         }
@@ -1120,20 +1138,20 @@ def get_dashboard_html() -> str:
                 const profile = await (await fetch('/api/interop')).json();
                 body.innerHTML = Object.entries(profile).map(([section, value]) => {
                     if (Array.isArray(value)) {
-                        return `<h3 style="margin-top:15px;">${section}</h3><ul>` +
-                            value.map(v => `<li>${v}</li>`).join('') + '</ul>';
+                        return `<h3 style="margin-top:15px;">${esc(section)}</h3><ul>` +
+                            value.map(v => `<li>${esc(v)}</li>`).join('') + '</ul>';
                     }
                     if (value && typeof value === 'object') {
-                        return `<h3 style="margin-top:15px;">${section}</h3><table><tbody>` +
+                        return `<h3 style="margin-top:15px;">${esc(section)}</h3><table><tbody>` +
                             Object.entries(value).map(([k, v]) =>
-                                `<tr><td><strong>${k}</strong></td><td>${
-                                    typeof v === 'object' ? JSON.stringify(v) : v}</td></tr>`
+                                `<tr><td><strong>${esc(k)}</strong></td><td>${
+                                    esc(typeof v === 'object' ? JSON.stringify(v) : v)}</td></tr>`
                             ).join('') + '</tbody></table>';
                     }
-                    return `<p><strong>${section}:</strong> ${value}</p>`;
+                    return `<p><strong>${esc(section)}:</strong> ${esc(value)}</p>`;
                 }).join('');
             } catch (e) {
-                body.innerHTML = 'Profilo non disponibile: ' + e;
+                body.textContent = 'Profilo non disponibile: ' + e;
             }
         }
 
@@ -1207,62 +1225,68 @@ def get_dashboard_html() -> str:
         function renderInstruments(instruments) {
             document.getElementById('instruments').innerHTML = instruments.map(i =>
                 `<div class="instrument-card">
-                    <div class="name">${i.name}</div>
-                    ${i.host ? `<div class="info"><strong>Host:</strong> ${i.host}${i.port ? ':' + i.port : ''}</div>` : ''}
-                    <div class="info"><strong>Tipo:</strong> ${i.type}</div>
-                    <div class="info"><strong>Status:</strong> <span class="badge ${i.status.toLowerCase()}">${i.status}</span></div>
-                    <div class="info"><strong>Ultimi messaggi:</strong> ${i.last_message_at || 'mai'}</div>
-                    <div class="info"><strong>Totale messaggi:</strong> ${i.messages_received}</div>
+                    <div class="name">${esc(i.name)}</div>
+                    ${i.host ? `<div class="info"><strong>Host:</strong> ${esc(i.host)}${i.port ? ':' + esc(i.port) : ''}</div>` : ''}
+                    <div class="info"><strong>Tipo:</strong> ${esc(i.type)}</div>
+                    <div class="info"><strong>Status:</strong> <span class="badge ${cssClass(i.status)}">${esc(i.status)}</span></div>
+                    <div class="info"><strong>Ultimi messaggi:</strong> ${esc(i.last_message_at || 'mai')}</div>
+                    <div class="info"><strong>Totale messaggi:</strong> ${esc(i.messages_received)}</div>
                 </div>`
             ).join('');
         }
 
         function renderOrders(orders) {
             const tbody = document.querySelector('#ordersTable tbody');
+            // La sample key arriva da HL7 (SPM-2/ORC-2): mai interpolata dentro un
+            // gestore inline, altrimenti un apice nel barcode diventa codice.
+            // Viaggia come data-attribute ed e' letta dal gestore.
             tbody.innerHTML = orders.map(o =>
                 `<tr>
-                    <td><strong>${o.sample_key}</strong></td>
-                    <td><span class="badge ${o.status.toLowerCase()}">${o.status}</span></td>
-                    <td>${o.created_at.substring(0, 19)}</td>
-                    <td>${o.updated_at.substring(0, 19)}</td>
+                    <td><strong>${esc(o.sample_key)}</strong></td>
+                    <td><span class="badge ${cssClass(o.status)}">${esc(o.status)}</span></td>
+                    <td>${esc((o.created_at || '').substring(0, 19))}</td>
+                    <td>${esc((o.updated_at || '').substring(0, 19))}</td>
                     <td>
-                        <button class="action-button" onclick="viewOrder('${o.sample_key}')">Dettagli</button>
-                        ${o.status === 'ERROR' ? `<button class="action-button" onclick="retryOrder('${o.sample_key}')">Retry</button>` : ''}
-                        ${o.status !== 'SENT' ? `<button class="action-button danger" onclick="cancelOrder('${o.sample_key}')">Cancella</button>` : ''}
+                        <button class="action-button" data-key="${esc(o.sample_key)}"
+                                onclick="viewOrder(this.dataset.key)">Dettagli</button>
+                        ${o.status === 'ERROR' ? `<button class="action-button" data-key="${esc(o.sample_key)}"
+                                onclick="retryOrder(this.dataset.key)">Retry</button>` : ''}
+                        ${o.status !== 'SENT' ? `<button class="action-button danger" data-key="${esc(o.sample_key)}"
+                                onclick="cancelOrder(this.dataset.key)">Cancella</button>` : ''}
                     </td>
                 </tr>`
             ).join('');
         }
 
         async function viewOrder(sampleKey) {
-            const resp = await fetch(`/api/orders/${sampleKey}`);
+            const resp = await fetch(`/api/orders/${encodeURIComponent(sampleKey)}`);
             const data = await resp.json();
             const modal = document.getElementById('orderModal');
             const body = document.getElementById('orderModalBody');
 
             let html = `
-                <div><strong>Sample Key:</strong> ${sampleKey}</div>
-                <div><strong>Status:</strong> <span class="badge ${data.order.status.toLowerCase()}">${data.order.status}</span></div>
-                <div><strong>Creato:</strong> ${data.order.created_at}</div>
-                <div><strong>Aggiornato:</strong> ${data.order.updated_at}</div>
+                <div><strong>Sample Key:</strong> ${esc(sampleKey)}</div>
+                <div><strong>Status:</strong> <span class="badge ${cssClass(data.order.status)}">${esc(data.order.status)}</span></div>
+                <div><strong>Creato:</strong> ${esc(data.order.created_at)}</div>
+                <div><strong>Aggiornato:</strong> ${esc(data.order.updated_at)}</div>
                 <hr style="margin: 15px 0; border: none; border-bottom: 1px solid #ddd;">
                 <h3 style="margin-top: 20px;">Ordine (JSON)</h3>
-                <pre>${JSON.stringify(JSON.parse(data.order.order_json), null, 2)}</pre>
+                <pre>${esc(JSON.stringify(JSON.parse(data.order.order_json), null, 2))}</pre>
                 <h3 style="margin-top: 20px;">Risultati</h3>
                 ${data.results.length > 0 ? data.results.map((r, i) =>
-                    `<div style="margin-bottom: 10px;"><strong>Risultato ${i+1}:</strong><pre>${JSON.stringify(r, null, 2)}</pre></div>`
+                    `<div style="margin-bottom: 10px;"><strong>Risultato ${i+1}:</strong><pre>${esc(JSON.stringify(r, null, 2))}</pre></div>`
                 ).join('') : '<p>Nessun risultato</p>'}
                 <h3 style="margin-top: 20px;">Timing</h3>
-                ${data.timing ? `<pre>${JSON.stringify(data.timing, null, 2)}</pre>` : '<p>-</p>'}
+                ${data.timing ? `<pre>${esc(JSON.stringify(data.timing, null, 2))}</pre>` : '<p>-</p>'}
                 <h3 style="margin-top: 20px;">Scambi HL7</h3>
                 ${(data.messages && data.messages.length) ? `<table><thead><tr>
                         <th>Quando</th><th>Dir</th><th>Tipo</th><th>Control ID</th><th>ACK</th>
                     </tr></thead><tbody>` + data.messages.map(m => `<tr>
-                        <td>${(m.timestamp || '').replace('T', ' ')}</td>
-                        <td>${m.direction}</td>
-                        <td>${m.message_type || '-'}</td>
-                        <td>${m.control_id || '-'}</td>
-                        <td>${m.ack_code || '-'}${m.error_code ? ' (' + m.error_code + ')' : ''}${m.duplicate ? ' dup' : ''}</td>
+                        <td>${esc((m.timestamp || '').replace('T', ' '))}</td>
+                        <td>${esc(m.direction)}</td>
+                        <td>${esc(m.message_type || '-')}</td>
+                        <td>${esc(m.control_id || '-')}</td>
+                        <td>${esc(m.ack_code || '-')}${m.error_code ? ' (' + esc(m.error_code) + ')' : ''}${m.duplicate ? ' dup' : ''}</td>
                     </tr>`).join('') + '</tbody></table>'
                     : '<p>Nessuno scambio registrato per questo ordine.</p>'}
             `;
@@ -1277,7 +1301,7 @@ def get_dashboard_html() -> str:
 
         async function retryOrder(sampleKey) {
             if (!confirm("Riprovare l'inoltro di questo ordine?")) return;
-            const resp = await fetch(`/api/orders/${sampleKey}/retry`, { method: 'POST' });
+            const resp = await fetch(`/api/orders/${encodeURIComponent(sampleKey)}/retry`, { method: 'POST' });
             if (resp.ok) {
                 alert('Ordine rimesso in coda per retry');
                 updateDashboard();
@@ -1288,7 +1312,7 @@ def get_dashboard_html() -> str:
 
         async function cancelOrder(sampleKey) {
             if (!confirm('Cancellare definitivamente questo ordine?')) return;
-            const resp = await fetch(`/api/orders/${sampleKey}/cancel`, { method: 'POST' });
+            const resp = await fetch(`/api/orders/${encodeURIComponent(sampleKey)}/cancel`, { method: 'POST' });
             if (resp.ok) {
                 alert('Ordine cancellato');
                 updateDashboard();
@@ -1327,6 +1351,7 @@ def get_dashboard_html() -> str:
             { key: 'hl7_dedup_retention_hours', label: 'Finestra deduplica (ore)', type: 'number', step: '1', section: 'HL7' },
             { key: 'mllp_read_timeout', label: 'MLLP — attesa primo messaggio (s)', type: 'number', step: '1', section: 'HL7' },
             { key: 'mllp_idle_timeout', label: 'MLLP — inattività connessione persistente (s)', type: 'number', step: '1', section: 'HL7' },
+            { key: 'mllp_max_connections', label: 'MLLP — connessioni simultanee per listener (0 = illimitate)', type: 'number', step: '1', section: 'HL7' },
 
             // Strumenti
             { key: 'result_listen_host', label: 'Risultati in ingresso — host', type: 'text', section: 'Strumenti' },
@@ -1427,18 +1452,21 @@ def get_dashboard_html() -> str:
         }
 
         function renderSettingsFieldHtml(f, value) {
+            // I valori vengono da config.json: anche se non arrivano dalla rete,
+            // un apice in un comando VPN spezzerebbe l'attributo senza escape.
             if (f.type === 'checkbox') {
                 return `<label class="settings-field checkbox">
-                    <input type="checkbox" data-key="${f.key}" ${value ? 'checked' : ''}> ${f.label}
+                    <input type="checkbox" data-key="${esc(f.key)}" ${value ? 'checked' : ''}> ${esc(f.label)}
                 </label>`;
             }
             if (f.type === 'select') {
-                const opts = f.options.map(o => `<option value="${o}" ${o === value ? 'selected' : ''}>${o}</option>`).join('');
-                return `<label class="settings-field"><span>${f.label}</span><select data-key="${f.key}">${opts}</select></label>`;
+                const opts = f.options.map(o =>
+                    `<option value="${esc(o)}" ${o === value ? 'selected' : ''}>${esc(o)}</option>`).join('');
+                return `<label class="settings-field"><span>${esc(f.label)}</span><select data-key="${esc(f.key)}">${opts}</select></label>`;
             }
-            const step = f.step ? ` step="${f.step}"` : '';
+            const step = f.step ? ` step="${esc(f.step)}"` : '';
             const v = value === null || value === undefined ? '' : value;
-            return `<label class="settings-field"><span>${f.label}</span><input type="${f.type}" data-key="${f.key}" value="${v}"${step}></label>`;
+            return `<label class="settings-field"><span>${esc(f.label)}</span><input type="${esc(f.type)}" data-key="${esc(f.key)}" value="${esc(v)}"${step}></label>`;
         }
 
         function collectSettingsPayload() {

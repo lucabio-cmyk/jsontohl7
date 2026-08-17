@@ -21,9 +21,17 @@ garantire:
  14  enhanced mode in uscita: SENT solo dopo l'ACK applicativo del LIS
  15  solo commit ACK dal LIS: l'ordine resta ritentabile
  16  payload senza MSH: rifiutato con ERR
+ 17  finestra di deduplica misurata sull'ultima attivita' (last_seen)
+ 18  tetto alle connessioni simultanee del server MLLP
+ 19  rifiuto di un ordine in modalita' "order": ORR/ORL con ORC-1 = UA
+ 20  copie identiche concorrenti: elaborazione una sola volta
+ 21  dashboard: nessun campo HL7 interpolato senza escape (XSS memorizzato)
 """
+import datetime as _dt
 import socket
 import sys
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -425,6 +433,147 @@ def test_malformed(store):
         rx.stop()
 
 
+# --------------------------------------------------------------------------- 17-21 rilievi di review
+def test_dedup_purge_uses_last_seen(store):
+    """La finestra di deduplica si misura sull'ultima attivita': un messaggio
+    ancora in ritrasmissione non deve scadere e rientrare come nuovo."""
+    store.remember_processed("LIS", "OLD-1", "ORM^O01", "BC-OLD", "AA", "ack")
+    store.remember_processed("LIS", "ACTIVE-1", "ORM^O01", "BC-ACT", "AA", "ack")
+    with store._conn() as c:
+        # Entrambi visti la prima volta 100 ore fa; solo il secondo e' ancora attivo.
+        old = (_dt.datetime.now() - _dt.timedelta(hours=100)).isoformat(timespec="seconds")
+        c.execute("UPDATE processed_messages SET first_seen=?, last_seen=?", (old, old))
+        c.execute("UPDATE processed_messages SET last_seen=? WHERE control_id='ACTIVE-1'",
+                  (_dt.datetime.now().isoformat(timespec="seconds"),))
+    removed = store.purge_processed(older_than_hours=72.0)
+    ck("17 Deduplica: la pulizia rimuove solo i control id inattivi", removed == 1, str(removed))
+    ck("17 Deduplica: il control id ancora ritrasmesso sopravvive alla pulizia",
+       store.find_processed("LIS", "ACTIVE-1") is not None
+       and store.find_processed("LIS", "OLD-1") is None)
+
+
+def test_connection_limit(store):
+    """Con le connessioni persistenti un peer potrebbe tenere occupati thread e
+    socket: il tetto configurato deve rifiutare le connessioni in eccesso."""
+    rx = ResultReceiver(store, "127.0.0.1", 0, max_connections=2, idle_timeout=5.0).start()
+    port = rx._server.bound_port
+    held = []
+    try:
+        for _ in range(2):
+            s = socket.create_connection(("127.0.0.1", port), timeout=3.0)
+            s.sendall(mllp.frame(oru(ctrl=f"C{len(held)}", sample="BC-LIMIT")))
+            mllp.FrameReader(s).read(3.0)          # connessione attiva e in attesa
+            held.append(s)
+        extra = socket.create_connection(("127.0.0.1", port), timeout=3.0)
+        held.append(extra)
+        extra.settimeout(3.0)
+        closed = extra.recv(16) == b""             # il server chiude subito l'eccedenza
+        ck("18 Limite connessioni: la connessione oltre il tetto viene chiusa subito", closed)
+        ck("18 Limite connessioni: le connessioni entro il tetto restano attive",
+           rx._server.active_connections == 2, str(rx._server.active_connections))
+        held.pop().close()
+        for s in list(held):                       # liberato uno slot, si rientra
+            s.close()
+            held.remove(s)
+        deadline = time.monotonic() + 3.0
+        while rx._server.active_connections and time.monotonic() < deadline:
+            time.sleep(0.05)
+        s = socket.create_connection(("127.0.0.1", port), timeout=3.0)
+        held.append(s)
+        s.sendall(mllp.frame(oru(ctrl="C-AFTER", sample="BC-LIMIT")))
+        reply = mllp.FrameReader(s).read(3.0)
+        ck("18 Limite connessioni: chiusa una connessione lo slot torna disponibile",
+           reply is not None and field(reply.decode(), "MSA", 1) == "AA")
+    finally:
+        for s in held:
+            s.close()
+        rx.stop()
+
+
+def test_order_response_on_reject(store):
+    """In modalita' "order" anche il rifiuto deve arrivare come ORR/ORL con
+    ORC-1 = UA, non come ACK generico."""
+    rx = OrderReceiver(store, "127.0.0.1", 0, order_response_mode="order").start()
+    port = rx._server.bound_port
+    try:
+        bad = CR.join([msh(ctrl="RJ1"), "ORC|NW||", "OBR|1|||58410-2^Emocromo^LN"]) + CR
+        reply = exchange_raw(port, [bad])[0]
+        ck("19 Rifiuto in modalita' order: risposta ORR^O02, non ACK",
+           field(reply, "MSH", 9) == "ORR^O02^ORR_O02", field(reply, "MSH", 9))
+        ck("19 Rifiuto in modalita' order: MSA negativo e ORC-1 = UA",
+           field(reply, "MSA", 1) == "AR" and field(reply, "ORC", 1) == "UA",
+           f"{field(reply, 'MSA', 1)}/{field(reply, 'ORC', 1)}")
+        err = hl7.Message(reply).seg("ERR")
+        ck("19 Rifiuto in modalita' order: il segmento ERR resta presente",
+           bool(err) and hl7.comp(hl7.get(err, 3), 0) == "101", hl7.get(err or [], 3))
+
+        oml = CR.join([msh(ctrl="RJ2", mtype="OML^O21"), "ORC|NW||"]) + CR
+        reply = exchange_raw(port, [oml])[0]
+        ck("19 Rifiuto in modalita' order: OML riceve ORL^O22",
+           field(reply, "MSH", 9) == "ORL^O22^ORL_O22", field(reply, "MSH", 9))
+    finally:
+        rx.stop()
+
+
+def test_concurrent_duplicates(store):
+    """Due copie identiche in arrivo insieme su connessioni diverse: una sola
+    deve essere elaborata (la deduplica non deve avere una finestra di corsa)."""
+    rx = ResultReceiver(store, "127.0.0.1", 0).start()
+    port = rx._server.bound_port
+    try:
+        store.upsert_order({"sample_key": "BC-RACE", "patient": {}, "universal_service_id": {}})
+        message = oru(ctrl="RACE-1", sample="BC-RACE")
+        replies: list[str] = []
+        errors: list[Exception] = []
+        start = threading.Barrier(4)
+
+        def worker():
+            try:
+                start.wait(timeout=5)
+                replies.extend(exchange_raw(port, [message]))
+            except Exception as e:      # pragma: no cover - diagnostica del test
+                errors.append(e)
+
+        # La barriera sincronizza i soli 4 worker: partono insieme, cosi' le
+        # copie identiche arrivano davvero in contemporanea.
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        ck("20 Corsa sulla deduplica: nessun errore nelle 4 richieste concorrenti",
+           not errors and len(replies) == 4, f"{errors} {len(replies)}")
+        ck("20 Corsa sulla deduplica: il risultato viene inserito una sola volta",
+           len(store.results_for("BC-RACE")) == 1, str(len(store.results_for("BC-RACE"))))
+        ck("20 Corsa sulla deduplica: tutte le copie ricevono un ACK positivo",
+           all(field(r, "MSA", 1) == "AA" for r in replies))
+        prev = store.find_processed("ANALYZER", "RACE-1")
+        ck("20 Corsa sulla deduplica: le ritrasmissioni sono contate",
+           bool(prev) and prev["hits"] == 4, str(prev and prev["hits"]))
+    finally:
+        rx.stop()
+
+
+def test_dashboard_escaping():
+    """I valori che arrivano da messaggi HL7 finiscono nella dashboard: devono
+    essere inseriti come testo, mai come markup (XSS memorizzato)."""
+    try:
+        from hl7mw.api import get_dashboard_html
+    except ImportError:
+        print("[OK]     21 Dashboard: test escaping saltato (fastapi non installato)")
+        return
+    html = get_dashboard_html()
+    ck("21 Dashboard: esiste la funzione di escaping", "function esc(value)" in html)
+    risky = ["${r.control_id", "${r.sample_key", "${r.message_type", "${o.sample_key}",
+             "${i.name}", "${m.control_id", "${data.order.status}"]
+    found = [r for r in risky if r in html]
+    ck("21 Dashboard: nessun campo HL7 interpolato senza escape", not found, str(found))
+    ck("21 Dashboard: la sample key non finisce dentro un gestore inline",
+       "onclick=\"viewOrder(this.dataset.key)\"" in html
+       and "viewOrder('${" not in html)
+
+
 def test_parse_ack_helpers():
     raw = hl7.build_ack(CR.join([msh(ctrl="Z1")]) + CR, "AE", "campo mancante",
                         error_code="101")
@@ -448,6 +597,11 @@ def main() -> int:
     test_custom_delimiters(fresh_store("delims"))
     test_forward_enhanced(fresh_store("forward"))
     test_malformed(fresh_store("malformed"))
+    test_dedup_purge_uses_last_seen(fresh_store("purge"))
+    test_connection_limit(fresh_store("connlimit"))
+    test_order_response_on_reject(fresh_store("reject"))
+    test_concurrent_duplicates(fresh_store("race"))
+    test_dashboard_escaping()
     test_parse_ack_helpers()
 
     if ck.failed:

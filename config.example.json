@@ -39,6 +39,7 @@
   "hl7_dedup_retention_hours": 72.0,
   "mllp_read_timeout": 60.0,
   "mllp_idle_timeout": 300.0,
+  "mllp_max_connections": 64,
 
   "status_enabled": true,
   "status_host": "127.0.0.1",

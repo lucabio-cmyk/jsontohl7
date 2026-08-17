@@ -26,7 +26,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
+from contextlib import contextmanager
 
 from . import ack as ackmod
 from . import hl7, mllp
@@ -40,6 +42,38 @@ RESPONSE_ACK = "ack"          # ACK^O01^ACK generico (default, comportamento sto
 RESPONSE_ORDER = "order"      # ORR^O02 (per ORM) / ORL^O22 (per OML)
 
 
+class _KeyedLocks:
+    """Lock per chiave, con conteggio dei detentori.
+
+    Serve a rendere atomica la sequenza "controlla se e' un duplicato →
+    elabora → registra": senza, due copie identiche che arrivano insieme su due
+    connessioni diverse passerebbero entrambe dal controllo prima che l'una
+    registri, e il risultato clinico verrebbe inserito due volte. I listener
+    vivono tutti in questo processo, quindi un lock in memoria e' sufficiente.
+    """
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._locks: dict[tuple, tuple[threading.Lock, int]] = {}
+
+    @contextmanager
+    def acquire(self, key: tuple):
+        with self._guard:
+            lock, holders = self._locks.get(key, (threading.Lock(), 0))
+            self._locks[key] = (lock, holders + 1)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            with self._guard:
+                lock, holders = self._locks[key]
+                if holders <= 1:
+                    del self._locks[key]        # niente crescita illimitata
+                else:
+                    self._locks[key] = (lock, holders - 1)
+
+
 # --------------------------------------------------------------------------- canale in ingresso
 class InboundChannel:
     """Server MLLP con la logica di riscontro comune a tutti i canali in ingresso."""
@@ -51,16 +85,18 @@ class InboundChannel:
                  monitor: DeviceMonitor | None = None, *,
                  ack_mode: str = ackmod.MODE_AUTO, include_err: bool = True,
                  dedup: bool = True, read_timeout: float = 60.0,
-                 idle_timeout: float = 300.0):
+                 idle_timeout: float = 300.0, max_connections: int = 64):
         self.store = store
         self.host, self.port = host, port
         self.sending_app, self.sending_facility = sending_app, sending_facility
         self.monitor = monitor
         self.dedup = dedup
         self.read_timeout, self.idle_timeout = read_timeout, idle_timeout
+        self.max_connections = max_connections
         self.policy = ackmod.AckPolicy(sending_app=sending_app,
                                        sending_facility=sending_facility,
                                        mode=ack_mode, include_err=include_err)
+        self._locks = _KeyedLocks()
         self._server: mllp.MllpServer | None = None
 
     # ----- da implementare nelle sottoclassi -----
@@ -71,7 +107,8 @@ class InboundChannel:
     def start(self):
         self._server = mllp.MllpServer(self.host, self.port, self._handle,
                                        read_timeout=self.read_timeout,
-                                       idle_timeout=self.idle_timeout).start()
+                                       idle_timeout=self.idle_timeout,
+                                       max_connections=self.max_connections).start()
         LOG.info("%s in ascolto su %s:%s (canale %s)", type(self).__name__,
                  self.host, self._server.bound_port, self.channel)
         return self
@@ -130,33 +167,51 @@ class InboundChannel:
                                  sample_key=prev.get("sample_key") or "",
                                  duplicate=True)
 
-    def _handle_one(self, message: str) -> list[str]:
-        started = time.monotonic()
-        header = hl7.parse_header(message)
-        peer = mllp.current_peer()
-        digest = hashlib.sha256(message.encode("utf-8", errors="replace")).hexdigest()
-        outcome: ackmod.AckOutcome | None = None
-
-        if not header.message_code:
-            LOG.warning("%s: MSH illeggibile o incompleto — rifiutato.", type(self).__name__)
-            outcome = ackmod.AckOutcome(code="AR", text="MSH incompleto o illeggibile",
-                                        error_code="101")
-        elif self.dedup and header.control_id:
-            outcome = self._replay(message, header, digest)
-
+    def _process_or_replay(self, message: str, header: hl7.MessageHeader,
+                           digest: str) -> tuple[ackmod.AckOutcome, list[str]]:
+        """Elabora il messaggio (o ne ripete il riscontro se e' un duplicato) e
+        costruisce le risposte. Chiamata sotto lock per chiave di deduplica."""
+        outcome = self._replay(message, header, digest) if (
+            self.dedup and header.control_id) else None
         if outcome is None:
             try:
                 outcome = self.process(message, header)
             except hl7.Hl7Error as e:
                 LOG.warning("%s: messaggio rifiutato: %s", type(self).__name__, e)
                 outcome = ackmod.AckOutcome.from_hl7_error(e)
-
+                outcome.body = self.error_response(message, header, outcome)
         replies = self.policy.responses(message, header, outcome)
         if self.dedup and not outcome.duplicate and header.control_id:
             application = replies[-1] if replies else ""
             self.store.remember_processed(header.sending_app, header.control_id,
                                           header.message_type, outcome.sample_key or None,
                                           outcome.code, application, digest)
+        return outcome, replies
+
+    def error_response(self, message: str, header: hl7.MessageHeader,
+                       outcome: ackmod.AckOutcome) -> str | None:
+        """Risposta applicativa alternativa all'ACK in caso di rifiuto.
+        None = ACK/NACK generico. Ridefinita da OrderReceiver."""
+        return None
+
+    def _handle_one(self, message: str) -> list[str]:
+        started = time.monotonic()
+        header = hl7.parse_header(message)
+        peer = mllp.current_peer()
+        digest = hashlib.sha256(message.encode("utf-8", errors="replace")).hexdigest()
+
+        if not header.message_code:
+            LOG.warning("%s: MSH illeggibile o incompleto — rifiutato.", type(self).__name__)
+            outcome = ackmod.AckOutcome(code="AR", text="MSH incompleto o illeggibile",
+                                        error_code="101")
+            replies = self.policy.responses(message, header, outcome)
+        elif self.dedup and header.control_id:
+            # Sotto lock: due copie identiche arrivate insieme su connessioni
+            # diverse non devono poter superare entrambe il controllo duplicati.
+            with self._locks.acquire((header.sending_app, header.control_id)):
+                outcome, replies = self._process_or_replay(message, header, digest)
+        else:
+            outcome, replies = self._process_or_replay(message, header, digest)
         plan = self.policy.plan(header, outcome.ok)
         self.store.log_message(
             "IN", channel=self.channel, peer=peer,
@@ -212,6 +267,20 @@ class OrderReceiver(InboundChannel):
                 message, order, accepted=True, sending_app=self.sending_app,
                 sending_facility=self.sending_facility, header=header)
         return outcome
+
+    def error_response(self, message: str, header: hl7.MessageHeader,
+                       outcome: ackmod.AckOutcome) -> str | None:
+        """In modalita' "order" anche il rifiuto di un ordine deve arrivare come
+        risposta d'ordine (ORC-1 = UA, "unable to accept"), non come ACK generico:
+        altrimenti il LIS riceve un formato diverso da quello concordato proprio
+        nel caso in cui deve capire cosa non ha funzionato."""
+        if self.order_response_mode != RESPONSE_ORDER or not header.is_order:
+            return None
+        return hl7.build_order_response(
+            message, None, accepted=False, text=outcome.text,
+            sending_app=self.sending_app, sending_facility=self.sending_facility,
+            error_code=outcome.error_code if self.policy.include_err else "",
+            header=header, ack_code=outcome.code)
 
     def _handle_adt(self, message: str, header: hl7.MessageHeader) -> ackmod.AckOutcome:
         """ADT^A0x (es. A04 registrazione paziente): alcuni LIS lo inviano prima

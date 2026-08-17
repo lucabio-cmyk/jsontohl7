@@ -344,20 +344,54 @@ class MllpServer:
     # lettura del primo messaggio.
     idle_timeout: float = 300.0
     max_messages_per_connection: int = 0   # 0 = illimitato
+    # Connessioni simultanee ammesse. Con le connessioni persistenti ogni peer
+    # trattiene un thread e un socket fino all'idle timeout: senza un tetto, un
+    # host raggiungibile che apre connessioni e le lascia ferme esaurirebbe i
+    # thread del processo e impedirebbe al LIS/strumento vero di collegarsi.
+    # 0 = nessun limite (sconsigliato su una porta esposta).
+    max_connections: int = 64
     _srv: "socketserver.ThreadingTCPServer | None" = None
     _thread: "threading.Thread | None" = None
-    _connections: int = field(default=0, repr=False)
+    _active: int = field(default=0, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def bound_port(self) -> int:
         """Porta effettiva (utile con port=0 nei test)."""
         return self._srv.server_address[1] if self._srv else self.port
 
+    @property
+    def active_connections(self) -> int:
+        return self._active
+
+    def _acquire_slot(self) -> bool:
+        with self._lock:
+            if self.max_connections and self._active >= self.max_connections:
+                return False
+            self._active += 1
+            return True
+
+    def _release_slot(self) -> None:
+        with self._lock:
+            self._active = max(0, self._active - 1)
+
     def start(self) -> "MllpServer":
         outer = self
 
         class _H(socketserver.BaseRequestHandler):
             def handle(self):
+                if not outer._acquire_slot():
+                    LOG.warning("MLLP %s:%s: raggiunto il limite di %d connessioni "
+                                "simultanee, connessione da %s rifiutata.",
+                                outer.host, outer.port, outer.max_connections,
+                                self.client_address)
+                    return
+                try:
+                    self._serve()
+                finally:
+                    outer._release_slot()
+
+            def _serve(self):
                 reader = FrameReader(self.request)
                 handled = 0
                 try:

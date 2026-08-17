@@ -88,6 +88,11 @@ DEFAULTS = {
     # connessione persistente (un LIS tiene aperta la connessione per ore).
     "mllp_read_timeout": 60.0,
     "mllp_idle_timeout": 300.0,
+    # Tetto alle connessioni simultanee per listener: con le connessioni
+    # persistenti ogni peer trattiene un thread fino all'idle timeout, quindi
+    # senza limite un host raggiungibile potrebbe saturare il processo e
+    # impedire al LIS/strumento vero di collegarsi. 0 = nessun limite.
+    "mllp_max_connections": 64,
     "status_host": "127.0.0.1", "status_port": 8080, "status_enabled": True,
     "api_enabled": True, "api_host": "0.0.0.0", "api_port": 8000,
     "sending_app": "HL7MW", "sending_facility": "MIDDLEWARE",
@@ -178,6 +183,7 @@ def main(argv=None) -> int:
         dedup=cfg.get("hl7_dedup_enabled", True),
         read_timeout=cfg.get("mllp_read_timeout", 60.0),
         idle_timeout=cfg.get("mllp_idle_timeout", 300.0),
+        max_connections=cfg.get("mllp_max_connections", 64),
     )
 
     order_rx = OrderReceiver(store, cfg["order_listen_host"], cfg["order_listen_port"],
@@ -193,6 +199,7 @@ def main(argv=None) -> int:
             order_rx._handle,
             read_timeout=cfg.get("mllp_read_timeout", 60.0),
             idle_timeout=cfg.get("mllp_idle_timeout", 300.0),
+            max_connections=cfg.get("mllp_max_connections", 64),
         ).start()
         LOG.info("Canale ADT dedicato in ascolto su %s:%s (es. LIS con connessioni ADT/ORM separate)",
                 cfg.get("adt_listen_host") or cfg["order_listen_host"], cfg["adt_listen_port"])

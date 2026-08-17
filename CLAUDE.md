@@ -44,19 +44,27 @@ che applica a ogni canale in ingresso le stesse regole:
   MSH-10 ricevuto, MSH-10 dell'ACK proprio.
 - **Connessione persistente**: il server MLLP resta in lettura finche' il peer
   chiude o scade `mllp_idle_timeout`; `mllp.FrameReader` conserva il buffer, per
-  cui piu' messaggi nello stesso segmento TCP non vengono persi.
+  cui piu' messaggi nello stesso segmento TCP non vengono persi. Il rovescio
+  della medaglia e' che ogni peer trattiene un thread: `mllp_max_connections`
+  (default 64) limita le connessioni simultanee per listener.
 - **Batch / multi-messaggio**: `hl7.split_messages` scarta gli involucri
   FHS/BHS/BTS/FTS e risponde un ACK per ogni messaggio contenuto.
 - **Idempotenza**: la chiave e' MSH-3 + MSH-10 + impronta del contenuto
   (`store.processed_messages`). Ritrasmissione identica → si ripete lo stesso
   ACK senza rielaborare; stesso MSH-10 con contenuto diverso → si elabora
   comunque (perdere un risultato clinico e' peggio) e si registra l'anomalia in
-  audit. Finestra `hl7_dedup_retention_hours`, ripulita dal loop di `run.main()`.
+  audit. La sequenza "controlla → elabora → registra" gira sotto lock per
+  chiave (`pipeline._KeyedLocks`): due copie identiche in arrivo insieme su
+  connessioni diverse non possono superare entrambe il controllo. Finestra
+  `hl7_dedup_retention_hours` misurata sull'ultima attivita' (`last_seen`),
+  ripulita dal loop di `run.main()`.
 - **In uscita**: `lis_ack_mode: "enhanced"` mette MSH-15/16=AL nell'ORU e passa
   l'ordine a `SENT` solo dopo l'ACK applicativo; un `CA` isolato e' condizione
   transitoria (ordine ritentabile), non un successo.
 - **Risposta d'ordine**: `order_response_mode: "order"` risponde `ORR^O02`
-  (ORM) / `ORL^O22` (OML) invece dell'ACK generico, con ORC-1 `OK`/`UA`.
+  (ORM) / `ORL^O22` (OML) invece dell'ACK generico, con ORC-1 `OK`/`UA` — anche
+  sui rifiuti (`InboundChannel.error_response`), altrimenti il LIS riceverebbe
+  un formato diverso proprio quando deve capire cosa non ha funzionato.
 - **Tracciamento**: ogni scambio finisce in `store.message_log` (solo metadati
   di header e ACK, mai payload) → `GET /api/messages`, `python3 -m hl7mw.cli
   messages`, pannello "Traffico HL7 & riscontri" della dashboard. Il profilo
@@ -190,5 +198,10 @@ guida setup in `vpn/README.md`.
    batch aggregata (BHS/BTS in uscita), sequence number protocol (MSH-13/MSA-4).
 
 ## Attenzione (dominio sanitario)
+La dashboard mostra valori che arrivano da messaggi HL7 di terzi (sample key,
+control id, nome strumento): vanno sempre inseriti con `esc()` nel markup, mai
+interpolati grezzi in `innerHTML` o dentro un gestore inline — un MSH-10 con
+`<script>` verrebbe altrimenti eseguito nel browser dell'operatore.
+
 Dati clinici reali: niente dati paziente nei log/commit, attenzione a sicurezza del
 trasporto (TLS/stunnel sul MLLP) e tracciabilità (audit). In dubbio, chiedi.

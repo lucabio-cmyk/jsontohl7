@@ -536,7 +536,8 @@ ERROR_MESSAGES: dict[str, str] = {
 def build_order_response(message: str, order: dict | None, accepted: bool = True,
                          text: str = "", sending_app: str = "HL7MW",
                          sending_facility: str = "MIDDLEWARE",
-                         error_code: str = "", header: MessageHeader | None = None) -> str:
+                         error_code: str = "", header: MessageHeader | None = None,
+                         ack_code: str = "") -> str:
     """Risposta applicativa a un ordine: ORR^O02 per ORM^O01, ORL^O22 per OML^O21.
 
     Molti LIS si accontentano dell'ACK generico, ma lo standard prevede per
@@ -549,7 +550,8 @@ def build_order_response(message: str, order: dict | None, accepted: bool = True
     f, c = FLD, CMP
     is_oml = h.message_code == "OML"
     structure, trigger = ("ORL", "O22") if is_oml else ("ORR", "O02")
-    ack_code = "AA" if accepted else "AR"
+    # ack_code esplicito quando il chiamante distingue AE (errore) da AR (rifiuto).
+    ack_code = ack_code or ("AA" if accepted else "AR")
 
     msh = _ack_msh(h, sending_app, sending_facility, ver, structure=structure, trigger=trigger)
     # MSH-9.3 per ORR/ORL e' ORR_O02 / ORL_O22: _ack_msh mette <struct>^<trig>^<struct>,
