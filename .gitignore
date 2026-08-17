@@ -24,3 +24,6 @@ config.json
 build/
 dist/
 *.spec
+
+# setuptools (pip install .)
+*.egg-info/

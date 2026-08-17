@@ -18,8 +18,12 @@ build = ["pyinstaller>=6.0", "pyinstaller-hooks-contrib"]
 [project.scripts]
 hl7mw = "hl7mw.run:main"
 
-[tool.setuptools]
-packages = ["hl7mw"]
+[tool.setuptools.packages.find]
+# Auto-discovery (non un elenco statico "packages = [...]"): un elenco statico
+# includeva solo "hl7mw" e non i sottopacchetti (es. hl7mw.adapters), invisibile
+# con un editable install (espone comunque l'intero albero sorgente) ma con un
+# install normale mancava "hl7mw.adapters" -> ModuleNotFoundError a runtime.
+include = ["hl7mw*"]
 
 [tool.setuptools.package-data]
 # Chart.js vendorizzato per la dashboard (hl7mw/api.py): niente CDN esterno,

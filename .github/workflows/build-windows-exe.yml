@@ -16,7 +16,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[api]"
+          # Installazione NON editable (niente "-e"): un editable install (PEP 660)
+          # espone il pacchetto tramite un import hook custom invece che come
+          # normali file su disco sotto site-packages. PyInstaller lo importa
+          # correttamente in fase di build ma la sua analisi statica non riesce
+          # a risalire ai sottomoduli reali per impacchettarli nell'exe --
+          # fallisce a runtime con "ModuleNotFoundError: No module named 'hl7mw.run'"
+          # pur avendo compilato senza errori.
+          pip install ".[api]"
           pip install pyinstaller pyinstaller-hooks-contrib
 
       - name: Build eseguibile
