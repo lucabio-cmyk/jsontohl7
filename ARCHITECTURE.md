@@ -38,10 +38,11 @@ Tre flussi:
 
 | modulo            | responsabilità                                                        |
 |-------------------|-----------------------------------------------------------------------|
-| `hl7.py`          | parsing/costruzione HL7v2: `parse_order`, `parse_adt`, `parse_result`, `build_ack`, `build_oru` |
-| `mllp.py`         | trasporto MLLP: client (`send_message`/`exchange`) e server (`MllpServer`) |
-| `store.py`        | persistenza SQLite: ordini, risultati, orfani, ciclo di vita, query UI |
-| `pipeline.py`     | `OrderReceiver` (ORM/OML + ADT^A0x), `ResultReceiver`, `Forwarder` + regola di associazione |
+| `hl7.py`          | parsing/costruzione HL7v2: delimitatori (`Delimiters`/`Message`), header (`parse_header`), batch (`split_messages`), `parse_order`, `parse_adt`, `parse_result`, `build_ack`/`build_err`, `build_order_response`, `build_oru` |
+| `ack.py`          | politica di riscontro (cap. 2.9): original/enhanced mode via MSH-15/16, codici AA/AE/AR e CA/CE/CR, tabella errori HL7 0357 |
+| `mllp.py`         | trasporto MLLP: `FrameReader` (connessioni persistenti), client (`MllpClient`/`send_message_ex`) e server (`MllpServer`) |
+| `store.py`        | persistenza SQLite: ordini, risultati, orfani, ciclo di vita, traffico HL7 (`message_log`), idempotenza (`processed_messages`), query UI |
+| `pipeline.py`     | `InboundChannel` (ACK/dedup/log comuni), `OrderReceiver` (ORM/OML + ADT^A0x), `ResultReceiver`, `Forwarder` + regola di associazione |
 | `webstatus.py`    | endpoint di stato di sola lettura (aggancio per la UI)                 |
 | `vpn.py`          | avvio/verifica opzionale del tunnel VPN verso il LIS (es. sostituendo un fornitore cloud come Citizen Care Connect, vedi `INTEGRATION_CITIZENCARE.md`) |
 | `run.py`          | runner del servizio: avvia i receiver + loop del forwarder            |

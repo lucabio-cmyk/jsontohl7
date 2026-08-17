@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 
 from .. import hl7
-from ..mllp import MllpServer
+from ..mllp import MllpServer, current_peer
 from ..monitor import DeviceMonitor
 from ..pipeline import try_complete
 from ..store import Store
@@ -225,11 +225,27 @@ class HemoscreenHl7ResultReceiver:
         self.monitor = monitor
         self._server: MllpServer | None = None
 
+    def _log_message(self, message: str, ack_code: str, sample_key: str = "",
+                     ack_text: str = "") -> None:
+        """Traccia lo scambio nel message log comune (stessa vista della
+        dashboard usata per LIS e strumenti HL7 generici). Solo metadati."""
+        header = hl7.parse_header(message)
+        self.store.log_message(
+            "IN", channel="hemoscreen_hl7", peer=current_peer(),
+            sending_app=header.sending_app, sending_facility=header.sending_facility,
+            receiving_app=header.receiving_app, message_type=header.message_type,
+            control_id=header.control_id, version=header.version,
+            processing_id=header.processing_id, sample_key=sample_key or None,
+            ack_code=ack_code, ack_text=ack_text[:200] if ack_text else "",
+            ack_mode="original",
+        )
+
     def _handle(self, message: str) -> str:
         try:
             result = parse_hemoscreen_hl7(message)
         except hl7.Hl7Error as e:
             LOG.warning("HemoScreen HL7: messaggio non valido: %s", e)
+            self._log_message(message, "AE", ack_text=str(e))
             return _build_ack_hs(message, "AE", str(e),
                                   self.sending_app, self.sending_facility)
 
@@ -242,6 +258,7 @@ class HemoscreenHl7ResultReceiver:
             # Nessun Test Identifier: registra come non abbinato, ACK positivo
             self.store.add_unmatched(result, source_instrument=device_name)
             LOG.warning("HemoScreen HL7: risultato senza sample_key -> unmatched")
+            self._log_message(message, "AA")
             return _build_ack_hs(message, "AA", "",
                                   self.sending_app, self.sending_facility)
 
@@ -260,6 +277,7 @@ class HemoscreenHl7ResultReceiver:
                 key, result.get("observation_type"), len(result["results"]),
             )
 
+        self._log_message(message, "AA", sample_key=key)
         return _build_ack_hs(message, "AA", "",
                               self.sending_app, self.sending_facility)
 

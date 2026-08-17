@@ -65,6 +65,34 @@ DEFAULTS = {
     "forward_interval_seconds": 10.0,
     "ack_retry_attempts": 2,
     "ack_retry_backoff_seconds": 0.5,
+    # --- Riscontro HL7 (capitolo 2.9 dello standard) ---------------------------
+    # In ingresso: "auto" onora MSH-15/MSH-16 se il mittente li valorizza
+    # (enhanced mode: commit ACK + ACK applicativo), altrimenti risponde con un
+    # solo ACK come sempre. "original" ignora MSH-15/16, "enhanced" li impone.
+    "hl7_ack_mode": "auto",
+    # Aggiunge il segmento ERR (tabella HL7 0357) ai NACK: rende diagnosticabile
+    # il rifiuto invece di lasciare solo testo libero in MSA-3.
+    "hl7_ack_include_err": True,
+    # Idempotenza: una ritrasmissione con lo stesso MSH-10 non viene rielaborata,
+    # le si ripete l'ACK gia' dato (vedi store.processed_messages).
+    "hl7_dedup_enabled": True,
+    "hl7_dedup_retention_hours": 72.0,
+    # Risposta agli ordini: "ack" (ACK^O01^ACK) oppure "order" (ORR^O02 per ORM,
+    # ORL^O22 per OML) per i LIS che si aspettano la risposta applicativa d'ordine.
+    "order_response_mode": "ack",
+    # In uscita verso il LIS: "original" (un solo ACK) o "enhanced" (MSH-15/16=AL,
+    # il LIS risponde commit ACK e poi ACK applicativo; SENT solo sul secondo).
+    "lis_ack_mode": "original",
+    "lis_application_ack_timeout": 0,   # 0 = usa mllp_read_timeout
+    # Timeout MLLP: attesa del primo messaggio e inattivita' massima di una
+    # connessione persistente (un LIS tiene aperta la connessione per ore).
+    "mllp_read_timeout": 60.0,
+    "mllp_idle_timeout": 300.0,
+    # Tetto alle connessioni simultanee per listener: con le connessioni
+    # persistenti ogni peer trattiene un thread fino all'idle timeout, quindi
+    # senza limite un host raggiungibile potrebbe saturare il processo e
+    # impedire al LIS/strumento vero di collegarsi. 0 = nessun limite.
+    "mllp_max_connections": 64,
     "status_host": "127.0.0.1", "status_port": 8080, "status_enabled": True,
     "api_enabled": True, "api_host": "0.0.0.0", "api_port": 8000,
     "sending_app": "HL7MW", "sending_facility": "MIDDLEWARE",
@@ -148,8 +176,20 @@ def main(argv=None) -> int:
         vpn_manager = vpnmod.from_config(cfg)
         vpn_manager.ensure_up()  # non bloccante: logga ed eventualmente ritenta nel loop
 
+    # Opzioni di riscontro comuni ai canali in ingresso (vedi hl7mw/ack.py).
+    inbound_opts = dict(
+        ack_mode=cfg.get("hl7_ack_mode", "auto"),
+        include_err=cfg.get("hl7_ack_include_err", True),
+        dedup=cfg.get("hl7_dedup_enabled", True),
+        read_timeout=cfg.get("mllp_read_timeout", 60.0),
+        idle_timeout=cfg.get("mllp_idle_timeout", 300.0),
+        max_connections=cfg.get("mllp_max_connections", 64),
+    )
+
     order_rx = OrderReceiver(store, cfg["order_listen_host"], cfg["order_listen_port"],
-                             cfg["sending_app"], cfg["sending_facility"], monitor).start()
+                             cfg["sending_app"], cfg["sending_facility"], monitor,
+                             order_response_mode=cfg.get("order_response_mode", "ack"),
+                             **inbound_opts).start()
 
     adt_rx_server = None
     if cfg.get("adt_listen_port"):
@@ -157,17 +197,24 @@ def main(argv=None) -> int:
             cfg.get("adt_listen_host") or cfg["order_listen_host"],
             cfg["adt_listen_port"],
             order_rx._handle,
+            read_timeout=cfg.get("mllp_read_timeout", 60.0),
+            idle_timeout=cfg.get("mllp_idle_timeout", 300.0),
+            max_connections=cfg.get("mllp_max_connections", 64),
         ).start()
         LOG.info("Canale ADT dedicato in ascolto su %s:%s (es. LIS con connessioni ADT/ORM separate)",
                 cfg.get("adt_listen_host") or cfg["order_listen_host"], cfg["adt_listen_port"])
 
     result_rx = ResultReceiver(store, cfg["result_listen_host"], cfg["result_listen_port"],
-                               cfg["sending_app"], cfg["sending_facility"], monitor).start()
+                               cfg["sending_app"], cfg["sending_facility"], monitor,
+                               **inbound_opts).start()
     oru_cfg = hl7.OruConfig(cfg["sending_app"], cfg["sending_facility"],
                             cfg["receiving_app"], cfg["receiving_facility"])
     forwarder = Forwarder(store, cfg["lis_host"], cfg["lis_port"], oru_cfg,
+                          read_timeout=cfg.get("mllp_read_timeout", 30.0),
                           ack_retry_attempts=cfg.get("ack_retry_attempts", 2),
-                          ack_retry_backoff_seconds=cfg.get("ack_retry_backoff_seconds", 0.5))
+                          ack_retry_backoff_seconds=cfg.get("ack_retry_backoff_seconds", 0.5),
+                          ack_mode=cfg.get("lis_ack_mode", "original"),
+                          application_ack_timeout=cfg.get("lis_application_ack_timeout") or None)
 
     status = None
     if cfg.get("status_enabled"):
@@ -232,6 +279,11 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
     LOG.info("Middleware avviato. Ctrl-C per fermare.")
+    LOG.info("Riscontro HL7: ingresso=%s, risposta ordini=%s, verso LIS=%s, deduplica=%s.",
+             cfg.get("hl7_ack_mode", "auto"), cfg.get("order_response_mode", "ack"),
+             cfg.get("lis_ack_mode", "original"),
+             "attiva" if cfg.get("hl7_dedup_enabled", True) else "disattiva")
+    last_purge = time.monotonic()
 
     try:
         while not _STOP:
@@ -248,6 +300,19 @@ def main(argv=None) -> int:
                 monitor.update_health_status()
             except Exception:
                 LOG.exception("Errore nel controllo health strumenti; continuo.")
+            try:
+                # Sfoltisce la tabella di deduplica: oltre la finestra di
+                # ritrasmissione plausibile i control id non servono piu' e la
+                # tabella crescerebbe senza limite.
+                now = time.monotonic()
+                if cfg.get("hl7_dedup_enabled", True) and now - last_purge >= 3600:
+                    last_purge = now
+                    removed = store.purge_processed(cfg.get("hl7_dedup_retention_hours", 72.0))
+                    if removed:
+                        LOG.info("Deduplica: rimossi %d control id oltre le %.0f ore.",
+                                 removed, cfg.get("hl7_dedup_retention_hours", 72.0))
+            except Exception:
+                LOG.exception("Errore nella pulizia della tabella di deduplica; continuo.")
             slept = 0.0
             while slept < cfg["forward_interval_seconds"] and not _STOP:
                 time.sleep(0.5)

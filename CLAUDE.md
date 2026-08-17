@@ -24,8 +24,57 @@ Associazione per `sample_key` (specimen/barcode → filler → placer). Risultat
 ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY → SENT
 (o ERROR). Vedi `store.py`.
 
+## Riscontro e comunicazione HL7 (cap. 2 dello standard)
+
+Tutto cio' che riguarda l'ACK sta in `hl7mw/ack.py` (politica) e `hl7mw/hl7.py`
+(costruzione dei messaggi); i due receiver condividono `pipeline.InboundChannel`,
+che applica a ogni canale in ingresso le stesse regole:
+
+- **Original / enhanced mode**: `hl7_ack_mode` = `auto` (default) onora MSH-15
+  (accept ack) e MSH-16 (application ack) se il mittente li valorizza — commit
+  ACK `CA/CE/CR` seguito dall'ACK applicativo `AA/AE/AR`, due risposte sulla
+  stessa connessione — altrimenti risponde con un solo ACK come sempre.
+  MSH-16 assente = regole original mode (ACK applicativo comunque inviato);
+  si tace solo su un `NE` esplicito.
+- **NACK diagnosticabili**: segmento `ERR` con codice della tabella HL7 0357
+  (ERR-3/ERR-4 dalla 2.4, ERR-1 in forma ELD fino alla 2.3.1). Gli `Hl7Error`
+  portano il proprio `error_code`, non solo un testo.
+- **ACK conforme**: `ACK^<trigger>^ACK`, MSH-11/MSH-12 echeggiati dal messaggio
+  in ingresso (un messaggio di test `T` non va riscontrato come `P`), MSA-2 =
+  MSH-10 ricevuto, MSH-10 dell'ACK proprio.
+- **Connessione persistente**: il server MLLP resta in lettura finche' il peer
+  chiude o scade `mllp_idle_timeout`; `mllp.FrameReader` conserva il buffer, per
+  cui piu' messaggi nello stesso segmento TCP non vengono persi. Il rovescio
+  della medaglia e' che ogni peer trattiene un thread: `mllp_max_connections`
+  (default 64) limita le connessioni simultanee per listener.
+- **Batch / multi-messaggio**: `hl7.split_messages` scarta gli involucri
+  FHS/BHS/BTS/FTS e risponde un ACK per ogni messaggio contenuto.
+- **Idempotenza**: la chiave e' MSH-3 + MSH-10 + impronta del contenuto
+  (`store.processed_messages`). Ritrasmissione identica → si ripete lo stesso
+  ACK senza rielaborare; stesso MSH-10 con contenuto diverso → si elabora
+  comunque (perdere un risultato clinico e' peggio) e si registra l'anomalia in
+  audit. La sequenza "controlla → elabora → registra" gira sotto lock per
+  chiave (`pipeline._KeyedLocks`): due copie identiche in arrivo insieme su
+  connessioni diverse non possono superare entrambe il controllo. Finestra
+  `hl7_dedup_retention_hours` misurata sull'ultima attivita' (`last_seen`),
+  ripulita dal loop di `run.main()`.
+- **In uscita**: `lis_ack_mode: "enhanced"` mette MSH-15/16=AL nell'ORU e passa
+  l'ordine a `SENT` solo dopo l'ACK applicativo; un `CA` isolato e' condizione
+  transitoria (ordine ritentabile), non un successo.
+- **Risposta d'ordine**: `order_response_mode: "order"` risponde `ORR^O02`
+  (ORM) / `ORL^O22` (OML) invece dell'ACK generico, con ORC-1 `OK`/`UA` — anche
+  sui rifiuti (`InboundChannel.error_response`), altrimenti il LIS riceverebbe
+  un formato diverso proprio quando deve capire cosa non ha funzionato.
+- **Tracciamento**: ogni scambio finisce in `store.message_log` (solo metadati
+  di header e ACK, mai payload) → `GET /api/messages`, `python3 -m hl7mw.cli
+  messages`, pannello "Traffico HL7 & riscontri" della dashboard. Il profilo
+  attivo e' esposto da `GET /api/interop`.
+
+Test: `python3 tests/test_hl7_ack.py` (deve stampare "TUTTI I TEST ACK/HL7 OK").
+
 ## HOW
-- Eseguire i test: `python3 tests/test_e2e.py` (deve stampare "TUTTI I TEST OK").
+- Eseguire i test: `python3 tests/test_e2e.py` (deve stampare "TUTTI I TEST OK");
+  gli altri file in `tests/` si eseguono allo stesso modo, uno per volta.
 - Avviare il servizio: `python3 -m hl7mw.run -c config.json`.
 - HL7: separatore segmento `\r`, framing MLLP `0x0B … 0x1C 0x0D`. Non introdurre `\n`.
 - Convenzioni: commenti/log in italiano; nomi e docstring chiari; niente librerie esterne
@@ -45,6 +94,8 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
 - **`instruments`**: tracciamento device collegati con heartbeat, status (ONLINE/OFFLINE/UNKNOWN), msg count
 - **`audit_log`**: log immutabile per tracciabilità clinica (events, severity, timestamp)
 - **`order_timing`**: timing di ogni ordine (received, first_result, ready, sent) → metriche dashboard
+- **`message_log`**: un record per messaggio HL7 scambiato (header + esito ACK, senza payload)
+- **`processed_messages`**: control id già elaborati per l'idempotenza (vedi sezione riscontro)
 - **`orders.source_instrument`**: associazione ordine al device sorgente
 - Colonne estese su `results` e `unmatched_results` per source_instrument
 
@@ -56,6 +107,11 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
 - Endpoint `/api/instruments` — status tutti device
 - Endpoint `/api/unmatched` — risultati orfani + `/match` per riconciliazione manuale
 - Endpoint `/api/audit-log` — log tracciabilità (filtri per sample/event)
+- Endpoint `/api/messages` — traffico HL7 con esito del riscontro (filtri direzione/canale/
+  sample/control id/solo NACK), `/api/messages/stats` (riepilogo) e `/api/messages/duplicates`
+  (ritrasmissioni rilevate); solo metadati, nessun payload → nessun dato paziente
+- Endpoint `/api/interop` — profilo di interoperabilità attivo (messaggi accettati, modalità di
+  riscontro, deduplica, cosa NON è supportato): la dichiarazione da consegnare a chi integra
 - Endpoint `/api/config` (GET/PUT) — configurazione completa (LIS/strumenti/VPN/servizio) per
   la pagina Impostazioni della dashboard; scrive su `config.json`, **non applicata a runtime**
   (componenti inizializzati all'avvio, serve riavvio) — validazione chiavi/tipi contro
@@ -67,7 +123,9 @@ ordine → tabella `unmatched_results`. Ciclo di vita ordine: RECEIVED → READY
 - Endpoint `/api/logs` — tail (default 200 righe) del log tecnico applicativo su file
   (`hl7mw/logging_setup.py`), diverso dall'audit_log clinico — 404 se `log_file` non configurato
 - **Dashboard HTML moderna**: Chart.js (doughnut chart status, metriche KPI, tabelle ordini, azioni,
-  device status), pannello "Log Applicativo" (tail del file di log, refresh manuale)
+  device status), pannello "Traffico HL7 & riscontri" (KPI messaggi/NACK/duplicati, ultimi scambi,
+  filtro solo-NACK, modale "Profilo interop"), sezione HL7 nelle Impostazioni, cronologia degli
+  scambi nel dettaglio ordine, pannello "Log Applicativo" (tail del file di log, refresh manuale)
 
 Abilitazione: `"api_enabled": true` in config, oppure `pip install fastapi uvicorn`
 
@@ -85,6 +143,10 @@ python3 -m hl7mw.cli --db hl7mw.db audit-log [--sample-key S] [--event-type X] [
 python3 -m hl7mw.cli --db hl7mw.db instruments     # elenco device
 python3 -m hl7mw.cli --db hl7mw.db stats           # statistiche globali
 python3 -m hl7mw.cli --db hl7mw.db unmatched       # risultati orfani
+# Traffico HL7 e riscontri
+python3 -m hl7mw.cli --db hl7mw.db messages [--direction IN|OUT] [--channel orders] [--errors]
+python3 -m hl7mw.cli --db hl7mw.db message-stats   # totali per direzione/ACK, NACK, duplicati
+python3 -m hl7mw.cli --db hl7mw.db duplicates      # control id ripetuti (ritrasmissioni/riuso)
 python3 -m hl7mw.cli logs [--lines 100]            # log tecnico (non richiede --db)
 ```
 
@@ -131,7 +193,15 @@ guida setup in `vpn/README.md`.
 5. Supporto esplicito `ADT^A08` (update paziente, dichiarato da CCHS ma non
    ancora distinto da A04 in `_handle_adt`, che oggi tratta tutti gli ADT allo
    stesso modo: ACK positivo, nessuna persistenza).
+6. HL7 ancora scoperto (vedi tabella in `INTEROPERABILITY.md`): query/response
+   `QBP^Q11`–`RSP^K11` per la worklist su richiesta dello strumento, risposta
+   batch aggregata (BHS/BTS in uscita), sequence number protocol (MSH-13/MSA-4).
 
 ## Attenzione (dominio sanitario)
+La dashboard mostra valori che arrivano da messaggi HL7 di terzi (sample key,
+control id, nome strumento): vanno sempre inseriti con `esc()` nel markup, mai
+interpolati grezzi in `innerHTML` o dentro un gestore inline — un MSH-10 con
+`<script>` verrebbe altrimenti eseguito nel browser dell'operatore.
+
 Dati clinici reali: niente dati paziente nei log/commit, attenzione a sicurezza del
 trasporto (TLS/stunnel sul MLLP) e tracciabilità (audit). In dubbio, chiedi.
