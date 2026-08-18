@@ -23,18 +23,32 @@ jobs:
           # a risalire ai sottomoduli reali per impacchettarli nell'exe --
           # fallisce a runtime con "ModuleNotFoundError: No module named 'hl7mw.run'"
           # pur avendo compilato senza errori.
-          pip install ".[api]"
+          pip install ".[api,desktop]"
           pip install pyinstaller pyinstaller-hooks-contrib
 
       - name: Build eseguibile
         run: |
-          pyinstaller --onefile --name hl7mw-middleware --clean `
+          # --windowed: l'applicazione ha una finestra propria (hl7mw/desktop.py),
+          # niente console alle spalle. Gli errori fatali dell'avvio arrivano
+          # all'utente come finestra di dialogo, non come traccia in una console
+          # che si chiude da sola.
+          pyinstaller --onefile --windowed --name hl7mw-middleware --clean `
             --add-data "hl7mw/static/chart.umd.min.js;hl7mw/static" `
+            --collect-submodules webview `
             packaging/win/hl7mw_entry.py
 
-      - name: Smoke test (avvio + --help)
+      - name: Smoke test (avvio reale del servizio + interfaccia)
         run: |
-          .\dist\hl7mw-middleware.exe --help
+          # --selftest avvia tutto (MLLP, dashboard) in una cartella dati
+          # temporanea, verifica che l'interfaccia risponda ed esce: prende
+          # anche gli errori di impacchettamento che un --help non vedrebbe.
+          # Start-Process -Wait: un eseguibile "windowed" non blocca la shell,
+          # quindi $LASTEXITCODE non sarebbe il suo codice di uscita.
+          $dataDir = "$env:RUNNER_TEMP\hl7mw-selftest"
+          $p = Start-Process -FilePath ".\dist\hl7mw-middleware.exe" `
+                 -ArgumentList "--selftest","--data-dir",$dataDir -Wait -PassThru
+          Get-Content "$dataDir\hl7mw.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
+          if ($p.ExitCode -ne 0) { throw "selftest fallito (exit $($p.ExitCode))" }
 
       - name: Copia config di esempio nel pacchetto
         run: Copy-Item config.example.json dist\config.example.json

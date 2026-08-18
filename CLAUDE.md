@@ -72,6 +72,36 @@ che applica a ogni canale in ingresso le stesse regole:
 
 Test: `python3 tests/test_hl7_ack.py` (deve stampare "TUTTI I TEST ACK/HL7 OK").
 
+## Applicazione desktop (eseguibile Windows)
+
+`hl7mw/desktop.py` e' il guscio dell'exe: NON contiene logica HL7, avvia
+`run.MiddlewareService` e si occupa di tutto cio' che serve perche' un doppio
+click funzioni senza spiegazioni.
+
+- **Cartella dati**: `%LOCALAPPDATA%\hl7mw` (Windows) o `~/.local/share/hl7mw`.
+  Database, log e `config.json` non finiscono piu' nella cartella di lancio, che
+  puo' essere di sola lettura (Program Files) o essere la cartella Download.
+  Alla prima esecuzione il `config.json` viene creato con i default.
+- **Istanza singola**: un socket sul loopback (porta 47615). Il secondo avvio
+  avvisa e indica l'interfaccia gia' attiva invece di morire con
+  "address already in use".
+- **Controllo porte prima dell'avvio**: `busy_ports()` dice *quale* porta e a
+  cosa serviva, invece di fallire a meta' avvio con alcuni listener gia' aperti.
+- **Interfaccia in tre livelli**: finestra embedded (pywebview/WebView2) →
+  finestra applicazione di Edge/Chrome (`--app=`, profilo dedicato) → browser di
+  sistema. L'utente non digita mai un indirizzo.
+- **Errori visibili**: un avvio fallito produce una finestra di dialogo
+  (`MessageBoxW`) oltre al log, perche' la build e' `--windowed` e non c'e'
+  nessuna console dove leggere una traceback.
+- Flag: `--headless` (solo servizio), `--browser`, `--selftest` (avvia,
+  verifica che l'interfaccia risponda, esce: e' anche lo smoke test del
+  workflow di build), `--data-dir`, `-c`.
+
+`api_host` di default e' `127.0.0.1`: la dashboard non ha ancora autenticazione,
+quindi non va esposta in rete senza una scelta esplicita.
+
+Test: `python3 tests/test_desktop.py` (deve stampare "TUTTI I TEST DESKTOP OK").
+
 ## HOW
 - Eseguire i test: `python3 tests/test_e2e.py` (deve stampare "TUTTI I TEST OK");
   gli altri file in `tests/` si eseguono allo stesso modo, uno per volta.

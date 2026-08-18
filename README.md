@@ -28,6 +28,8 @@ hl7mw/
   cli.py         CLI operativa (ordini, retry, cancel, audit, stats)
   adapters/      adapter per strumenti non-HL7 standard (es. HemoScreen)
   vpn.py         gestione opzionale del tunnel VPN verso il LIS (es. sostituzione Citizen Care Connect)
+  ack.py         politica di riscontro HL7 (original/enhanced, codici, tabella errori 0357)
+  desktop.py     applicazione desktop dell'eseguibile (finestra, cartella dati, istanza singola)
   run.py         runner del servizio (avvia tutti i componenti sopra)
 tests/           test end-to-end e di unità (senza pytest, eseguibili singolarmente)
 vpn/             template di configurazione VPN (WireGuard/OpenVPN) + guida setup
@@ -51,6 +53,28 @@ python3 -m hl7mw.run -c config.json
 Il core (`hl7mw/`) resta a **zero dipendenze esterne**: se FastAPI/uvicorn non sono
 installati, il servizio parte comunque — l'API viene semplicemente disabilitata con un
 warning nei log, e restano attivi ordini/risultati/inoltro + Stato UI minimale.
+
+### Applicazione desktop (eseguibile Windows)
+
+L'eseguibile prodotto dal workflow *Build Windows exe* non è il servizio "nudo": è
+un'applicazione con finestra propria (`hl7mw/desktop.py`). Doppio click e basta —
+nessun indirizzo da digitare, nessuna console.
+
+```bash
+pip install -e ".[api,desktop]"        # pywebview: finestra nativa (opzionale)
+python3 -m hl7mw.desktop               # o hl7mw-middleware.exe su Windows
+python3 -m hl7mw.desktop --headless    # solo servizio (systemd, servizio Windows)
+python3 -m hl7mw.desktop --selftest    # avvia, verifica l'interfaccia, esce (diagnostica)
+```
+
+- Dati e configurazione in `%LOCALAPPDATA%\hl7mw` (Windows) o `~/.local/share/hl7mw`,
+  non nella cartella da cui è stato lanciato l'eseguibile.
+- Seconda esecuzione: avvisa che il middleware è già attivo, non tenta di ripartire.
+- Porte occupate o cartella non scrivibile: finestra di dialogo che dice *quale* porta
+  e *quale* file correggere.
+- L'interfaccia viene aperta in una finestra dell'applicazione (WebView2/Edge); se non
+  è disponibile si ricade su una finestra applicazione di Edge/Chrome e infine sul
+  browser di sistema.
 
 ## Configurazione da GUI
 

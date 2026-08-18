@@ -16,7 +16,9 @@ import argparse
 import json
 import logging
 import signal
+import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -39,7 +41,6 @@ except ImportError:
     FASTAPI_AVAILABLE = False
 
 LOG = logging.getLogger("hl7mw")
-_STOP = False
 
 DEFAULTS = {
     "db_path": "hl7mw.db",
@@ -94,7 +95,11 @@ DEFAULTS = {
     # impedire al LIS/strumento vero di collegarsi. 0 = nessun limite.
     "mllp_max_connections": 64,
     "status_host": "127.0.0.1", "status_port": 8080, "status_enabled": True,
-    "api_enabled": True, "api_host": "0.0.0.0", "api_port": 8000,
+    # La dashboard non ha ancora autenticazione (vedi "Da fare" in CLAUDE.md):
+    # il default e' l'ascolto sul solo loopback. Per raggiungerla da un altro PC
+    # va messo esplicitamente "0.0.0.0" in configurazione, con la consapevolezza
+    # che chiunque sulla rete la vedrebbe.
+    "api_enabled": True, "api_host": "127.0.0.1", "api_port": 8000,
     "sending_app": "HL7MW", "sending_facility": "MIDDLEWARE",
     "receiving_app": "LIS", "receiving_facility": "OSP",
     "device_offline_timeout_seconds": 300.0,
@@ -122,6 +127,32 @@ DEFAULTS = {
 }
 
 
+# Chiavi di configurazione che contengono un percorso su disco.
+PATH_KEYS = ("db_path", "log_file")
+# Valori che non sono percorsi anche se non sono assoluti (SQLite in memoria,
+# URI sqlite): vanno lasciati intatti.
+_NON_PATH_VALUES = (":memory:",)
+
+
+def resolve_config_paths(cfg: dict, config_path: str | None) -> dict:
+    """Rende assoluti (in-place) i percorsi relativi, rispetto al file di
+    configurazione che li contiene.
+
+    "Relativo al proprio file" e non "relativo alla directory corrente": la
+    directory corrente di un processo avviato da un'icona e' imprevedibile, e
+    componenti diversi (servizio, dashboard, CLI) la vedrebbero diversa,
+    finendo per scrivere e leggere file differenti con la stessa configurazione.
+    """
+    base = Path(config_path).expanduser().resolve().parent if config_path else Path.cwd()
+    for key in PATH_KEYS:
+        value = cfg.get(key)
+        if not value or value in _NON_PATH_VALUES or str(value).startswith("file:"):
+            continue
+        if not Path(value).is_absolute():
+            cfg[key] = str(base / value)
+    return cfg
+
+
 def load_config(path: str | None) -> dict:
     cfg = dict(DEFAULTS)
     if not path and Path("config.json").exists():
@@ -130,12 +161,7 @@ def load_config(path: str | None) -> dict:
         path = "config.json"
     if path:
         cfg.update(json.loads(Path(path).read_text(encoding="utf-8")))
-    return cfg
-
-
-def _sig(_s, _f):
-    global _STOP
-    _STOP = True
+    return resolve_config_paths(cfg, path)
 
 
 def resolve_vpn_health_check(cfg: dict) -> None:
@@ -150,15 +176,312 @@ def resolve_vpn_health_check(cfg: dict) -> None:
         cfg["vpn_health_check_port"] = cfg.get("lis_port")
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Middleware HL7v2 order-driven.")
+class _ApiServer:
+    """Adattatore per far rientrare uvicorn nel ciclo di vita del servizio:
+    espone lo stesso `stop()` degli altri listener."""
+
+    def __init__(self, server, thread: threading.Thread):
+        self.server = server
+        self.thread = thread
+
+    def stop(self) -> None:
+        self.server.should_exit = True
+        self.thread.join(timeout=5.0)
+        if self.thread.is_alive():
+            LOG.warning("La dashboard non si e' fermata entro 5s; il thread e' daemon, "
+                        "verra' chiuso con il processo.")
+
+
+class MiddlewareService:
+    """I componenti del middleware come un oggetto avviabile e fermabile.
+
+    Esiste perche' il servizio ha due modi di essere eseguito e devono
+    condividere esattamente la stessa inizializzazione:
+      - `run.main()`, che avvia e poi resta nel loop periodico;
+      - `hl7mw.desktop`, che avvia in un thread e tiene il thread principale
+        per la finestra dell'interfaccia (i toolkit grafici lo richiedono).
+    """
+
+    def __init__(self, cfg: dict, config_path: str = "config.json"):
+        self.cfg = cfg
+        self.config_path = config_path
+        self.store: Store | None = None
+        self.monitor: DeviceMonitor | None = None
+        self.forwarder: Forwarder | None = None
+        self.vpn_manager = None
+        self._servers: list = []          # oggetti con .stop()
+        self._stop = threading.Event()
+        self._started = False
+        self._api_started = False
+        self._last_purge = time.monotonic()
+
+    # ----- indirizzi -----
+    @property
+    def api_enabled(self) -> bool:
+        """Dashboard configurata, disponibile e (dopo start) effettivamente in
+        ascolto: e' la condizione che decide quale interfaccia proporre."""
+        if not (bool(self.cfg.get("api_enabled")) and FASTAPI_AVAILABLE):
+            return False
+        return self._api_started if self._started else True
+
+    @property
+    def ui_endpoint(self) -> tuple[str, int] | None:
+        """(host, porta) dell'interfaccia effettivamente avviata, None se non ce
+        n'e' nessuna (API non disponibile e pagina di stato disabilitata)."""
+        if self.api_enabled:
+            host, port = self.cfg.get("api_host", "127.0.0.1"), self.cfg.get("api_port", 8000)
+        elif self.cfg.get("status_enabled"):
+            host, port = self.cfg.get("status_host", "127.0.0.1"), self.cfg.get("status_port", 8080)
+        else:
+            return None
+        # 0.0.0.0 e' un indirizzo di ascolto, non di connessione.
+        return ("127.0.0.1" if host in ("0.0.0.0", "::", "") else host), int(port)
+
+    @property
+    def ui_url(self) -> str:
+        """URL dell'interfaccia da aprire, stringa vuota se non ce n'e' una."""
+        endpoint = self.ui_endpoint
+        return f"http://{endpoint[0]}:{endpoint[1]}" if endpoint else ""
+
+    # ----- avvio -----
+    def start(self) -> "MiddlewareService":
+        """Avvia tutti i componenti. Se uno fallisce, quelli gia' avviati
+        vengono fermati prima di propagare l'errore: altrimenti resterebbero
+        listener aperti (e un tunnel VPN gestito da noi acceso) senza che il
+        chiamante abbia un riferimento su cui invocare stop()."""
+        try:
+            return self._start()
+        except Exception:
+            LOG.exception("Avvio fallito: fermo i componenti gia' avviati.")
+            self.stop()
+            raise
+
+    def _start(self) -> "MiddlewareService":
+        cfg = self.cfg
+        self.store = Store(cfg["db_path"])
+        self.monitor = DeviceMonitor(self.store, cfg.get("device_offline_timeout_seconds", 300.0))
+
+        if cfg.get("vpn_enabled"):
+            resolve_vpn_health_check(cfg)
+            self.vpn_manager = vpnmod.from_config(cfg)
+            self.vpn_manager.ensure_up()  # non bloccante: logga ed eventualmente ritenta nel loop
+
+        # Opzioni di riscontro comuni ai canali in ingresso (vedi hl7mw/ack.py).
+        inbound_opts = dict(
+            ack_mode=cfg.get("hl7_ack_mode", "auto"),
+            include_err=cfg.get("hl7_ack_include_err", True),
+            dedup=cfg.get("hl7_dedup_enabled", True),
+            read_timeout=cfg.get("mllp_read_timeout", 60.0),
+            idle_timeout=cfg.get("mllp_idle_timeout", 300.0),
+            max_connections=cfg.get("mllp_max_connections", 64),
+        )
+
+        order_rx = OrderReceiver(self.store, cfg["order_listen_host"], cfg["order_listen_port"],
+                                 cfg["sending_app"], cfg["sending_facility"], self.monitor,
+                                 order_response_mode=cfg.get("order_response_mode", "ack"),
+                                 **inbound_opts).start()
+        self._servers.append(order_rx)
+
+        if cfg.get("adt_listen_port"):
+            adt_host = cfg.get("adt_listen_host") or cfg["order_listen_host"]
+            self._servers.append(mllp.MllpServer(
+                adt_host, cfg["adt_listen_port"], order_rx._handle,
+                read_timeout=cfg.get("mllp_read_timeout", 60.0),
+                idle_timeout=cfg.get("mllp_idle_timeout", 300.0),
+                max_connections=cfg.get("mllp_max_connections", 64),
+            ).start())
+            LOG.info("Canale ADT dedicato in ascolto su %s:%s (es. LIS con connessioni ADT/ORM separate)",
+                     adt_host, cfg["adt_listen_port"])
+
+        self._servers.append(
+            ResultReceiver(self.store, cfg["result_listen_host"], cfg["result_listen_port"],
+                           cfg["sending_app"], cfg["sending_facility"], self.monitor,
+                           **inbound_opts).start())
+
+        oru_cfg = hl7.OruConfig(cfg["sending_app"], cfg["sending_facility"],
+                                cfg["receiving_app"], cfg["receiving_facility"])
+        self.forwarder = Forwarder(
+            self.store, cfg["lis_host"], cfg["lis_port"], oru_cfg,
+            read_timeout=cfg.get("mllp_read_timeout", 30.0),
+            ack_retry_attempts=cfg.get("ack_retry_attempts", 2),
+            ack_retry_backoff_seconds=cfg.get("ack_retry_backoff_seconds", 0.5),
+            ack_mode=cfg.get("lis_ack_mode", "original"),
+            application_ack_timeout=cfg.get("lis_application_ack_timeout") or None)
+
+        if cfg.get("status_enabled"):
+            self._servers.append(StatusServer(self.store, cfg["status_host"], cfg["status_port"]).start())
+            LOG.info("Status UI su http://%s:%s", cfg["status_host"], cfg["status_port"])
+
+        if bool(cfg.get("api_enabled")) and FASTAPI_AVAILABLE:
+            self._api_started = self._start_api()
+        elif cfg.get("api_enabled"):
+            LOG.warning("API abilitato ma FastAPI non installato (pip install fastapi uvicorn)")
+
+        if cfg.get("hemoscreen_hl7_enabled"):
+            self._servers.append(HemoscreenHl7ResultReceiver(
+                self.store, cfg["hemoscreen_hl7_host"], cfg["hemoscreen_hl7_port"],
+                cfg["sending_app"], cfg["sending_facility"], self.monitor).start())
+
+        if cfg.get("hemoscreen_poct1a2_enabled"):
+            self._servers.append(HemoscreenPoct1A2Receiver(
+                self.store, cfg["hemoscreen_poct1a2_host"], cfg["hemoscreen_poct1a2_port"],
+                continuous_mode=cfg["hemoscreen_poct1a2_continuous_mode"],
+                timeout=cfg["hemoscreen_poct1a2_timeout"], monitor=self.monitor).start())
+
+        self._started = True
+        LOG.info("Riscontro HL7: ingresso=%s, risposta ordini=%s, verso LIS=%s, deduplica=%s.",
+                 cfg.get("hl7_ack_mode", "auto"), cfg.get("order_response_mode", "ack"),
+                 cfg.get("lis_ack_mode", "original"),
+                 "attiva" if cfg.get("hl7_dedup_enabled", True) else "disattiva")
+        return self
+
+    def _start_api(self) -> bool:
+        """Avvia la dashboard e aspetta di sapere se e' partita davvero.
+
+        Con `uvicorn.run()` in un thread non c'era ne' un modo di fermarla ne'
+        di accorgersi di un bind fallito: l'interfaccia sarebbe rimasta in piedi
+        dopo un errore di avvio di un altro componente, e un fallimento del bind
+        avrebbe lasciato l'applicazione ad aspettare un indirizzo morto.
+        """
+        app = init_api(self.store, self.config_path, DEFAULTS)
+        host, port = self.cfg.get("api_host", "127.0.0.1"), self.cfg.get("api_port", 8000)
+        config = uvicorn.Config(
+            app, host=host, port=port, log_level="info", access_log=True,
+            # log_config=None: non applicare la configurazione di logging
+            # separata di uvicorn (che per default non propaga al logger
+            # radice) - cosi' anche i log di uvicorn/FastAPI (incluso l'access
+            # log di ogni richiesta) finiscono nello stesso file/console
+            # configurati da configure_logging(), invece di un flusso separato
+            # invisibile a chi legge hl7mw.log.
+            log_config=None,
+            # Espliciti (non "auto"): "auto" risolve l'implementazione via
+            # importlib a runtime, invisibile all'analisi statica di PyInstaller
+            # nell'eseguibile Windows (vedi packaging/win/). h11/asyncio sono
+            # puro Python, portabili senza compilazione; niente websocket: la
+            # dashboard usa solo HTTP/JSON.
+            loop="asyncio", http="h11", ws="none", lifespan="on",
+        )
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True, name="api")
+        thread.start()
+
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if getattr(server, "started", False):
+                self._servers.append(_ApiServer(server, thread))
+                LOG.info("Dashboard su http://%s:%s", host, port)
+                return True
+            if not thread.is_alive():
+                break                      # uvicorn e' morto: tipicamente bind fallito
+            time.sleep(0.05)
+        LOG.error("Dashboard non avviata su %s:%s (porta occupata o host non valido): "
+                  "il servizio prosegue senza di essa.", host, port)
+        server.should_exit = True
+        return False
+
+    def wait_until_ready(self, timeout: float = 15.0) -> bool:
+        """Attende che l'interfaccia risponda sulla sua porta.
+
+        L'app desktop deve aprire la finestra solo quando c'e' qualcosa da
+        mostrare: puntarla su un server non ancora in ascolto darebbe una
+        pagina di errore che non si aggiorna da sola.
+        """
+        endpoint = self.ui_endpoint
+        if endpoint is None:
+            LOG.info("Nessuna interfaccia configurata (api_enabled/status_enabled disattivi): "
+                     "il servizio lavora comunque, non c'e' nulla da aprire.")
+            return False
+        host, port = endpoint
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection((host, port), timeout=0.5):
+                    return True
+            except OSError:
+                time.sleep(0.2)
+        LOG.warning("Interfaccia non raggiungibile su %s:%s entro %.0fs.", host, port, timeout)
+        return False
+
+    # ----- loop periodico -----
+    def tick(self) -> None:
+        """Un giro di manutenzione: inoltro, health strumenti, pulizia deduplica."""
+        try:
+            self.forwarder.forward_ready()
+        except Exception:
+            LOG.exception("Errore nel loop di inoltro; continuo.")
+        try:
+            # Rileva strumenti andati OFFLINE (nessun messaggio da oltre
+            # device_offline_timeout_seconds): senza questa chiamata periodica
+            # lo status resta ONLINE per sempre dopo il primo messaggio, e la
+            # dashboard non segnalerebbe mai uno strumento spento/scollegato.
+            self.monitor.update_health_status()
+        except Exception:
+            LOG.exception("Errore nel controllo health strumenti; continuo.")
+        try:
+            # Sfoltisce la tabella di deduplica: oltre la finestra di
+            # ritrasmissione plausibile i control id non servono piu' e la
+            # tabella crescerebbe senza limite.
+            now = time.monotonic()
+            if self.cfg.get("hl7_dedup_enabled", True) and now - self._last_purge >= 3600:
+                self._last_purge = now
+                removed = self.store.purge_processed(self.cfg.get("hl7_dedup_retention_hours", 72.0))
+                if removed:
+                    LOG.info("Deduplica: rimossi %d control id oltre le %.0f ore.",
+                             removed, self.cfg.get("hl7_dedup_retention_hours", 72.0))
+        except Exception:
+            LOG.exception("Errore nella pulizia della tabella di deduplica; continuo.")
+
+    def run_forever(self) -> None:
+        """Loop periodico fino a stop(). Blocca il chiamante."""
+        self._last_purge = time.monotonic()
+        interval = self.cfg.get("forward_interval_seconds", 10.0)
+        while not self._stop.is_set():
+            self.tick()
+            self._stop.wait(interval)
+
+    def run_in_background(self) -> threading.Thread:
+        """Come run_forever() ma in un thread: usato dall'app desktop, che deve
+        lasciare libero il thread principale per la finestra."""
+        t = threading.Thread(target=self.run_forever, daemon=True, name="middleware-loop")
+        t.start()
+        return t
+
+    # ----- arresto -----
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def stop(self) -> None:
+        self.request_stop()
+        for server in self._servers:
+            try:
+                server.stop()
+            except Exception:
+                LOG.exception("Errore nell'arresto di %s; continuo.", type(server).__name__)
+        self._servers.clear()
+        self._api_started = False
+        if self.vpn_manager:
+            try:
+                self.vpn_manager.down()
+            except vpnmod.VpnError as e:
+                LOG.warning("VPN: arresto tunnel non riuscito: %s", e)
+        if self._started:
+            LOG.info("Middleware arrestato.")
+        self._started = False
+
+
+def setup(argv=None, description: str = "Middleware HL7v2 order-driven.") -> tuple[dict, str, argparse.Namespace]:
+    """Argomenti + configurazione + logging: la parte comune a CLI e app desktop."""
+    ap = argparse.ArgumentParser(description=description)
     ap.add_argument("-c", "--config")
     ap.add_argument("--loglevel", default=None,
                     help="Sovrascrive log_level della configurazione (DEBUG/INFO/WARNING/ERROR)")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     config_path = args.config or "config.json"
-
     configure_logging(
         level=args.loglevel or cfg.get("log_level", "INFO"),
         log_file=cfg.get("log_file", ""),
@@ -166,174 +489,23 @@ def main(argv=None) -> int:
         backup_count=cfg.get("log_backup_count", 5),
         console=cfg.get("log_console", True),
     )
+    return cfg, config_path, args
 
-    store = Store(cfg["db_path"])
-    monitor = DeviceMonitor(store, cfg.get("device_offline_timeout_seconds", 300.0))
 
-    vpn_manager = None
-    if cfg.get("vpn_enabled"):
-        resolve_vpn_health_check(cfg)
-        vpn_manager = vpnmod.from_config(cfg)
-        vpn_manager.ensure_up()  # non bloccante: logga ed eventualmente ritenta nel loop
+def main(argv=None) -> int:
+    cfg, config_path, _args = setup(argv)
+    service = MiddlewareService(cfg, config_path).start()
 
-    # Opzioni di riscontro comuni ai canali in ingresso (vedi hl7mw/ack.py).
-    inbound_opts = dict(
-        ack_mode=cfg.get("hl7_ack_mode", "auto"),
-        include_err=cfg.get("hl7_ack_include_err", True),
-        dedup=cfg.get("hl7_dedup_enabled", True),
-        read_timeout=cfg.get("mllp_read_timeout", 60.0),
-        idle_timeout=cfg.get("mllp_idle_timeout", 300.0),
-        max_connections=cfg.get("mllp_max_connections", 64),
-    )
+    def _handle_signal(_s, _f):
+        service.request_stop()
 
-    order_rx = OrderReceiver(store, cfg["order_listen_host"], cfg["order_listen_port"],
-                             cfg["sending_app"], cfg["sending_facility"], monitor,
-                             order_response_mode=cfg.get("order_response_mode", "ack"),
-                             **inbound_opts).start()
-
-    adt_rx_server = None
-    if cfg.get("adt_listen_port"):
-        adt_rx_server = mllp.MllpServer(
-            cfg.get("adt_listen_host") or cfg["order_listen_host"],
-            cfg["adt_listen_port"],
-            order_rx._handle,
-            read_timeout=cfg.get("mllp_read_timeout", 60.0),
-            idle_timeout=cfg.get("mllp_idle_timeout", 300.0),
-            max_connections=cfg.get("mllp_max_connections", 64),
-        ).start()
-        LOG.info("Canale ADT dedicato in ascolto su %s:%s (es. LIS con connessioni ADT/ORM separate)",
-                cfg.get("adt_listen_host") or cfg["order_listen_host"], cfg["adt_listen_port"])
-
-    result_rx = ResultReceiver(store, cfg["result_listen_host"], cfg["result_listen_port"],
-                               cfg["sending_app"], cfg["sending_facility"], monitor,
-                               **inbound_opts).start()
-    oru_cfg = hl7.OruConfig(cfg["sending_app"], cfg["sending_facility"],
-                            cfg["receiving_app"], cfg["receiving_facility"])
-    forwarder = Forwarder(store, cfg["lis_host"], cfg["lis_port"], oru_cfg,
-                          read_timeout=cfg.get("mllp_read_timeout", 30.0),
-                          ack_retry_attempts=cfg.get("ack_retry_attempts", 2),
-                          ack_retry_backoff_seconds=cfg.get("ack_retry_backoff_seconds", 0.5),
-                          ack_mode=cfg.get("lis_ack_mode", "original"),
-                          application_ack_timeout=cfg.get("lis_application_ack_timeout") or None)
-
-    status = None
-    if cfg.get("status_enabled"):
-        status = StatusServer(store, cfg["status_host"], cfg["status_port"]).start()
-        LOG.info("Status UI su http://%s:%s", cfg["status_host"], cfg["status_port"])
-
-    api_thread = None
-    if cfg.get("api_enabled") and FASTAPI_AVAILABLE:
-        import threading
-        app = init_api(store, config_path, DEFAULTS)
-
-        def run_api():
-            uvicorn.run(
-                app,
-                host=cfg.get("api_host", "0.0.0.0"),
-                port=cfg.get("api_port", 8000),
-                log_level="info",
-                access_log=True,
-                # log_config=None: non applicare la configurazione di logging
-                # separata di uvicorn (che per default non propaga al logger
-                # radice) - cosi' anche i log di uvicorn/FastAPI (incluso
-                # l'access log di ogni richiesta) finiscono nello stesso
-                # file/console configurati da configure_logging(), invece di
-                # un flusso separato invisibile a chi legge hl7mw.log.
-                log_config=None,
-                # Espliciti (non "auto"): "auto" risolve l'implementazione via
-                # importlib a runtime, invisibile all'analisi statica di PyInstaller
-                # nell'eseguibile Windows (vedi packaging/win/). h11/asyncio sono
-                # puro Python, portabili senza compilazione; niente websocket:
-                # la dashboard usa solo HTTP/JSON.
-                loop="asyncio", http="h11", ws="none", lifespan="on",
-            )
-
-        api_thread = threading.Thread(target=run_api, daemon=True)
-        api_thread.start()
-        LOG.info("FastAPI Dashboard su http://%s:%s", cfg.get("api_host", "0.0.0.0"), cfg.get("api_port", 8000))
-    elif cfg.get("api_enabled") and not FASTAPI_AVAILABLE:
-        LOG.warning("API abilitato ma FastAPI non installato (pip install fastapi uvicorn)")
-
-    hs_hl7 = None
-    if cfg.get("hemoscreen_hl7_enabled"):
-        hs_hl7 = HemoscreenHl7ResultReceiver(
-            store,
-            cfg["hemoscreen_hl7_host"],
-            cfg["hemoscreen_hl7_port"],
-            cfg["sending_app"],
-            cfg["sending_facility"],
-            monitor,
-        ).start()
-
-    hs_poct = None
-    if cfg.get("hemoscreen_poct1a2_enabled"):
-        hs_poct = HemoscreenPoct1A2Receiver(
-            store,
-            cfg["hemoscreen_poct1a2_host"],
-            cfg["hemoscreen_poct1a2_port"],
-            continuous_mode=cfg["hemoscreen_poct1a2_continuous_mode"],
-            timeout=cfg["hemoscreen_poct1a2_timeout"],
-            monitor=monitor,
-        ).start()
-
-    signal.signal(signal.SIGINT, _sig)
-    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
     LOG.info("Middleware avviato. Ctrl-C per fermare.")
-    LOG.info("Riscontro HL7: ingresso=%s, risposta ordini=%s, verso LIS=%s, deduplica=%s.",
-             cfg.get("hl7_ack_mode", "auto"), cfg.get("order_response_mode", "ack"),
-             cfg.get("lis_ack_mode", "original"),
-             "attiva" if cfg.get("hl7_dedup_enabled", True) else "disattiva")
-    last_purge = time.monotonic()
-
     try:
-        while not _STOP:
-            try:
-                forwarder.forward_ready()
-            except Exception:
-                LOG.exception("Errore nel loop di inoltro; continuo.")
-            try:
-                # Rileva strumenti andati OFFLINE (nessun messaggio da oltre
-                # device_offline_timeout_seconds): senza questa chiamata
-                # periodica lo status resta ONLINE per sempre dopo il primo
-                # messaggio, e la dashboard non segnalerebbe mai uno strumento
-                # spento/scollegato.
-                monitor.update_health_status()
-            except Exception:
-                LOG.exception("Errore nel controllo health strumenti; continuo.")
-            try:
-                # Sfoltisce la tabella di deduplica: oltre la finestra di
-                # ritrasmissione plausibile i control id non servono piu' e la
-                # tabella crescerebbe senza limite.
-                now = time.monotonic()
-                if cfg.get("hl7_dedup_enabled", True) and now - last_purge >= 3600:
-                    last_purge = now
-                    removed = store.purge_processed(cfg.get("hl7_dedup_retention_hours", 72.0))
-                    if removed:
-                        LOG.info("Deduplica: rimossi %d control id oltre le %.0f ore.",
-                                 removed, cfg.get("hl7_dedup_retention_hours", 72.0))
-            except Exception:
-                LOG.exception("Errore nella pulizia della tabella di deduplica; continuo.")
-            slept = 0.0
-            while slept < cfg["forward_interval_seconds"] and not _STOP:
-                time.sleep(0.5)
-                slept += 0.5
+        service.run_forever()
     finally:
-        order_rx.stop()
-        if adt_rx_server:
-            adt_rx_server.stop()
-        result_rx.stop()
-        if status:
-            status.stop()
-        if hs_hl7:
-            hs_hl7.stop()
-        if hs_poct:
-            hs_poct.stop()
-        if vpn_manager:
-            try:
-                vpn_manager.down()
-            except vpnmod.VpnError as e:
-                LOG.warning("VPN: arresto tunnel non riuscito: %s", e)
-        LOG.info("Middleware arrestato.")
+        service.stop()
     return 0
 
 
