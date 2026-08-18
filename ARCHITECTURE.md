@@ -45,7 +45,8 @@ Tre flussi:
 | `pipeline.py`     | `InboundChannel` (ACK/dedup/log comuni), `OrderReceiver` (ORM/OML + ADT^A0x), `ResultReceiver`, `Forwarder` + regola di associazione |
 | `webstatus.py`    | endpoint di stato di sola lettura (aggancio per la UI)                 |
 | `vpn.py`          | avvio/verifica opzionale del tunnel VPN verso il LIS (es. sostituendo un fornitore cloud come Citizen Care Connect, vedi `INTEGRATION_CITIZENCARE.md`) |
-| `run.py`          | runner del servizio: avvia i receiver + loop del forwarder            |
+| `run.py`          | `MiddlewareService` (avvio/arresto di tutti i componenti) + runner CLI |
+| `desktop.py`      | applicazione desktop dell'eseguibile: cartella dati scrivibile, istanza singola, finestra dell'interfaccia (embedded → finestra applicazione → browser), errori in dialogo |
 
 ## Associazione (matching)
 

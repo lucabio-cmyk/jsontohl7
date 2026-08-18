@@ -45,8 +45,10 @@
   "status_host": "127.0.0.1",
   "status_port": 8080,
 
+  "_comment_api": "La dashboard non ha autenticazione: api_host resta sul loopback (127.0.0.1), raggiungibile solo dal PC che esegue il middleware — l'app desktop apre l'interfaccia da sola in una finestra propria. Metterlo a 0.0.0.0 solo se serve raggiungerla da un altro PC, sapendo che chiunque sulla rete la vedrebbe.",
+
   "api_enabled": true,
-  "api_host": "0.0.0.0",
+  "api_host": "127.0.0.1",
   "api_port": 8000,
 
   "device_offline_timeout_seconds": 300.0,

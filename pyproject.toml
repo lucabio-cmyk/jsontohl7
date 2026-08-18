@@ -13,10 +13,15 @@ dependencies = []   # core a zero dipendenze (solo stdlib)
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 api = ["fastapi>=0.100", "uvicorn>=0.23"]
+# Finestra nativa dell'applicazione desktop (hl7mw/desktop.py). Su Windows usa
+# WebView2/Edge. Se manca, l'app ricade su una finestra "applicazione" di
+# Edge/Chrome e infine sul browser di sistema: e' un extra, non un requisito.
+desktop = ["pywebview>=5"]
 build = ["pyinstaller>=6.0", "pyinstaller-hooks-contrib"]
 
 [project.scripts]
 hl7mw = "hl7mw.run:main"
+hl7mw-desktop = "hl7mw.desktop:main"
 
 [tool.setuptools.packages.find]
 # Auto-discovery (non un elenco statico "packages = [...]"): un elenco statico
