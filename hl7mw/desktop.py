@@ -423,7 +423,16 @@ def main(argv=None) -> int:
             _wait_forever(service)
             return 0
 
-        service.wait_until_ready()
+        if not service.wait_until_ready():
+            # L'interfaccia non risponde: aprire comunque una finestra su quel
+            # indirizzo mostrerebbe una pagina di errore che non si aggiorna.
+            LOG.error("Interfaccia non raggiungibile su %s: il servizio resta attivo.", url)
+            show_message(WINDOW_TITLE,
+                         f"Il middleware è attivo, ma l'interfaccia non risponde su:\n{url}\n\n"
+                         f"Controlla il log:\n{cfg.get('log_file') or '(solo console)'}",
+                         error=True)
+            _wait_forever(service)
+            return 1
         LOG.info("Interfaccia pronta su %s", url)
         # Tre livelli, dal piu' integrato al piu' generico: finestra embedded,
         # finestra applicazione del browser Chromium di sistema, browser

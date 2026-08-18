@@ -16,6 +16,7 @@ Copre i modi in cui l'eseguibile "non funzionava" senza dirlo:
 10  nessuna interfaccia abilitata: niente attese a vuoto su un indirizzo morto
 11  avvio parziale: i componenti gia' avviati vengono chiusi
 12  percorsi relativi ancorati al file di configurazione (servizio e dashboard)
+13  dashboard dentro il ciclo di vita: fermata dal rollback, esclusa se non ascolta
 """
 import json
 import os
@@ -246,6 +247,65 @@ def test_partial_start_rollback(tmp: Path):
           desktop.port_is_free("0.0.0.0", ordini))
 
 
+def test_api_lifecycle(tmp: Path):
+    """La dashboard deve stare dentro il ciclo di vita del servizio: fermata
+    dal rollback e, se non riesce ad ascoltare, esclusa dalla scelta
+    dell'interfaccia da aprire."""
+    try:
+        import uvicorn  # noqa: F401
+    except ImportError:
+        print("[OK]     13 Ciclo di vita della dashboard: saltato (uvicorn non installato)")
+        return
+
+    # 13a — un listener che fallisce DOPO l'avvio della dashboard: la porta
+    # della dashboard non deve restare occupata.
+    api_port = free_port()
+    occupata = free_port()
+    with socket.socket() as s_occ:
+        s_occ.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s_occ.bind(("0.0.0.0", occupata))
+        s_occ.listen(1)
+        cfg = dict(runmod.DEFAULTS)
+        cfg.update({"order_listen_port": free_port(), "result_listen_port": free_port(),
+                    "api_enabled": True, "api_host": "127.0.0.1", "api_port": api_port,
+                    "status_enabled": False, "db_path": str(tmp / "apilife.db"),
+                    "hemoscreen_hl7_enabled": True, "hemoscreen_hl7_host": "0.0.0.0",
+                    "hemoscreen_hl7_port": occupata})
+        service = runmod.MiddlewareService(cfg, str(tmp / "config.json"))
+        try:
+            service.start()
+            check("13 Avvio fallito dopo la dashboard: errore propagato", False, "nessuna eccezione")
+        except OSError:
+            check("13 Avvio fallito dopo la dashboard: errore propagato", True)
+    deadline = time.monotonic() + 5.0
+    while not desktop.port_is_free("127.0.0.1", api_port) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    check("13 Il rollback ferma anche la dashboard (porta liberata)",
+          desktop.port_is_free("127.0.0.1", api_port))
+
+    # 13b — la dashboard non riesce ad ascoltare: si ripiega sulla pagina di
+    # stato invece di proporre un indirizzo morto.
+    busy = free_port()
+    status_port = free_port()
+    with socket.socket() as s_busy:
+        s_busy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s_busy.bind(("127.0.0.1", busy))
+        s_busy.listen(1)
+        cfg = dict(runmod.DEFAULTS)
+        cfg.update({"order_listen_port": free_port(), "result_listen_port": free_port(),
+                    "api_enabled": True, "api_host": "127.0.0.1", "api_port": busy,
+                    "status_enabled": True, "status_host": "127.0.0.1",
+                    "status_port": status_port, "db_path": str(tmp / "apifail.db")})
+        service = runmod.MiddlewareService(cfg, str(tmp / "config.json"))
+        service.start()
+        try:
+            check("13 Dashboard che non parte: l'interfaccia proposta e' la pagina di stato",
+                  service.ui_endpoint == ("127.0.0.1", status_port), str(service.ui_endpoint))
+            check("13 ...e risponde davvero", service.wait_until_ready(timeout=5.0))
+        finally:
+            service.stop()
+
+
 def test_relative_paths_follow_config(tmp: Path):
     """Percorsi relativi ancorati al file di configurazione: servizio e
     dashboard devono vedere gli stessi file anche se lanciati da altrove."""
@@ -336,6 +396,7 @@ def main() -> int:
         test_ports_follow_what_starts(tmp)
         test_no_ui_configured(tmp)
         test_partial_start_rollback(tmp)
+        test_api_lifecycle(tmp)
         test_relative_paths_follow_config(tmp)
         test_ui_chain(tmp)
         test_selftest_end_to_end(tmp)

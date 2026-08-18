@@ -176,6 +176,22 @@ def resolve_vpn_health_check(cfg: dict) -> None:
         cfg["vpn_health_check_port"] = cfg.get("lis_port")
 
 
+class _ApiServer:
+    """Adattatore per far rientrare uvicorn nel ciclo di vita del servizio:
+    espone lo stesso `stop()` degli altri listener."""
+
+    def __init__(self, server, thread: threading.Thread):
+        self.server = server
+        self.thread = thread
+
+    def stop(self) -> None:
+        self.server.should_exit = True
+        self.thread.join(timeout=5.0)
+        if self.thread.is_alive():
+            LOG.warning("La dashboard non si e' fermata entro 5s; il thread e' daemon, "
+                        "verra' chiuso con il processo.")
+
+
 class MiddlewareService:
     """I componenti del middleware come un oggetto avviabile e fermabile.
 
@@ -196,12 +212,17 @@ class MiddlewareService:
         self._servers: list = []          # oggetti con .stop()
         self._stop = threading.Event()
         self._started = False
+        self._api_started = False
         self._last_purge = time.monotonic()
 
     # ----- indirizzi -----
     @property
     def api_enabled(self) -> bool:
-        return bool(self.cfg.get("api_enabled")) and FASTAPI_AVAILABLE
+        """Dashboard configurata, disponibile e (dopo start) effettivamente in
+        ascolto: e' la condizione che decide quale interfaccia proporre."""
+        if not (bool(self.cfg.get("api_enabled")) and FASTAPI_AVAILABLE):
+            return False
+        return self._api_started if self._started else True
 
     @property
     def ui_endpoint(self) -> tuple[str, int] | None:
@@ -291,8 +312,8 @@ class MiddlewareService:
             self._servers.append(StatusServer(self.store, cfg["status_host"], cfg["status_port"]).start())
             LOG.info("Status UI su http://%s:%s", cfg["status_host"], cfg["status_port"])
 
-        if self.api_enabled:
-            self._start_api()
+        if bool(cfg.get("api_enabled")) and FASTAPI_AVAILABLE:
+            self._api_started = self._start_api()
         elif cfg.get("api_enabled"):
             LOG.warning("API abilitato ma FastAPI non installato (pip install fastapi uvicorn)")
 
@@ -314,30 +335,49 @@ class MiddlewareService:
                  "attiva" if cfg.get("hl7_dedup_enabled", True) else "disattiva")
         return self
 
-    def _start_api(self) -> None:
+    def _start_api(self) -> bool:
+        """Avvia la dashboard e aspetta di sapere se e' partita davvero.
+
+        Con `uvicorn.run()` in un thread non c'era ne' un modo di fermarla ne'
+        di accorgersi di un bind fallito: l'interfaccia sarebbe rimasta in piedi
+        dopo un errore di avvio di un altro componente, e un fallimento del bind
+        avrebbe lasciato l'applicazione ad aspettare un indirizzo morto.
+        """
         app = init_api(self.store, self.config_path, DEFAULTS)
         host, port = self.cfg.get("api_host", "127.0.0.1"), self.cfg.get("api_port", 8000)
+        config = uvicorn.Config(
+            app, host=host, port=port, log_level="info", access_log=True,
+            # log_config=None: non applicare la configurazione di logging
+            # separata di uvicorn (che per default non propaga al logger
+            # radice) - cosi' anche i log di uvicorn/FastAPI (incluso l'access
+            # log di ogni richiesta) finiscono nello stesso file/console
+            # configurati da configure_logging(), invece di un flusso separato
+            # invisibile a chi legge hl7mw.log.
+            log_config=None,
+            # Espliciti (non "auto"): "auto" risolve l'implementazione via
+            # importlib a runtime, invisibile all'analisi statica di PyInstaller
+            # nell'eseguibile Windows (vedi packaging/win/). h11/asyncio sono
+            # puro Python, portabili senza compilazione; niente websocket: la
+            # dashboard usa solo HTTP/JSON.
+            loop="asyncio", http="h11", ws="none", lifespan="on",
+        )
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True, name="api")
+        thread.start()
 
-        def run_api():
-            uvicorn.run(
-                app, host=host, port=port, log_level="info", access_log=True,
-                # log_config=None: non applicare la configurazione di logging
-                # separata di uvicorn (che per default non propaga al logger
-                # radice) - cosi' anche i log di uvicorn/FastAPI (incluso
-                # l'access log di ogni richiesta) finiscono nello stesso
-                # file/console configurati da configure_logging(), invece di
-                # un flusso separato invisibile a chi legge hl7mw.log.
-                log_config=None,
-                # Espliciti (non "auto"): "auto" risolve l'implementazione via
-                # importlib a runtime, invisibile all'analisi statica di PyInstaller
-                # nell'eseguibile Windows (vedi packaging/win/). h11/asyncio sono
-                # puro Python, portabili senza compilazione; niente websocket:
-                # la dashboard usa solo HTTP/JSON.
-                loop="asyncio", http="h11", ws="none", lifespan="on",
-            )
-
-        threading.Thread(target=run_api, daemon=True, name="api").start()
-        LOG.info("Dashboard su http://%s:%s", host, port)
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if getattr(server, "started", False):
+                self._servers.append(_ApiServer(server, thread))
+                LOG.info("Dashboard su http://%s:%s", host, port)
+                return True
+            if not thread.is_alive():
+                break                      # uvicorn e' morto: tipicamente bind fallito
+            time.sleep(0.05)
+        LOG.error("Dashboard non avviata su %s:%s (porta occupata o host non valido): "
+                  "il servizio prosegue senza di essa.", host, port)
+        server.should_exit = True
+        return False
 
     def wait_until_ready(self, timeout: float = 15.0) -> bool:
         """Attende che l'interfaccia risponda sulla sua porta.
@@ -422,6 +462,7 @@ class MiddlewareService:
             except Exception:
                 LOG.exception("Errore nell'arresto di %s; continuo.", type(server).__name__)
         self._servers.clear()
+        self._api_started = False
         if self.vpn_manager:
             try:
                 self.vpn_manager.down()
