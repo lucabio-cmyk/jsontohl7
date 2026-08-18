@@ -88,41 +88,92 @@ def prepare_data_dir(explicit: str | None = None) -> Path:
     return path
 
 
-def resolve_paths(cfg: dict, data_dir: Path) -> None:
-    """Rende assoluti, dentro la cartella dati, i percorsi relativi di config.
+def resolve_paths(cfg: dict, config_path: str | Path) -> None:
+    """Rende assoluti i percorsi relativi di configurazione (database, log).
 
-    Senza questo, database e log finirebbero nella directory di lavoro del
-    processo: per un'icona sul desktop e' imprevedibile (spesso C:\\Windows\\
-    System32) e a volte non scrivibile.
+    Delega a `run.resolve_config_paths`, che li ancora al file di
+    configurazione: cosi' servizio, dashboard (`GET /api/logs`) e CLI vedono
+    esattamente gli stessi file, indipendentemente dalla directory da cui e'
+    stata avviata l'applicazione.
     """
-    for key in ("db_path", "log_file"):
-        value = cfg.get(key)
-        if value and not Path(value).is_absolute():
-            cfg[key] = str(data_dir / value)
+    runmod.resolve_config_paths(cfg, str(config_path))
 
 
 # --------------------------------------------------------------------------- istanza singola
 class SingleInstance:
-    """Guardia di istanza singola basata su un socket di loopback."""
+    """Guardia di istanza singola basata su un socket di loopback.
+
+    Chi tiene il posto risponde a ogni connessione con un banner che lo
+    identifica: senza, un qualsiasi altro programma che occupasse la stessa
+    porta ci convincerebbe che il middleware e' gia' in esecuzione, mandando
+    l'utente su un'interfaccia inesistente senza alcun modo di rimediare.
+    """
+
+    BANNER = b"HL7MW-INSTANCE\n"
 
     def __init__(self, port: int = SINGLE_INSTANCE_PORT):
         self.port = port
         self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._closing = threading.Event()
 
     def acquire(self) -> bool:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            # Niente SO_REUSEADDR: qui vogliamo proprio fallire se un'altra
-            # copia e' gia' in ascolto.
+            if os.name != "nt":
+                # Su POSIX SO_REUSEADDR non permette due listener vivi sulla
+                # stessa porta (servirebbe SO_REUSEPORT): evita solo che il
+                # TIME_WAIT lasciato dall'handshake blocchi il riavvio subito
+                # dopo una chiusura. Su Windows la stessa opzione permetterebbe
+                # invece di scavalcare un socket vivo, quindi li' non si tocca.
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("127.0.0.1", self.port))
-            sock.listen(1)
+            sock.listen(5)
         except OSError:
             sock.close()
             return False
         self._sock = sock
+        self._thread = threading.Thread(target=self._serve_banner, daemon=True,
+                                        name="single-instance")
+        self._thread.start()
         return True
 
+    def _serve_banner(self) -> None:
+        # accept() con timeout invece che bloccante: chiudere il socket da un
+        # altro thread non sveglia una accept() gia' in corso (il socket
+        # resterebbe in LISTEN e la porta occupata anche dopo release()).
+        while not self._closing.is_set():
+            sock = self._sock
+            if sock is None:
+                return
+            try:
+                sock.settimeout(0.3)
+                conn, _ = sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return                      # socket chiuso: si esce
+            with conn:
+                try:
+                    conn.settimeout(1.0)
+                    conn.sendall(self.BANNER)
+                except OSError:
+                    pass
+
+    def held_by_this_app(self, timeout: float = 1.0) -> bool:
+        """True se la porta e' tenuta davvero da una nostra istanza."""
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as c:
+                c.settimeout(timeout)
+                return c.recv(len(self.BANNER)) == self.BANNER
+        except OSError:
+            return False
+
     def release(self) -> None:
+        self._closing.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=2.0)        # lascia uscire l'accept in corso
         if self._sock:
             self._sock.close()
             self._sock = None
@@ -151,7 +202,10 @@ def busy_ports(cfg: dict) -> list[tuple[str, str, int]]:
                        cfg.get("adt_listen_port")))
     wanted.append(("Risultati dagli strumenti", cfg.get("result_listen_host", "0.0.0.0"),
                    cfg.get("result_listen_port")))
-    if cfg.get("api_enabled"):
+    # Solo le porte che verranno davvero aperte: se "api_enabled" e' true ma
+    # FastAPI non e' installato la dashboard non parte, e pretendere quella
+    # porta bloccherebbe l'avvio per una porta che non useremmo.
+    if cfg.get("api_enabled") and runmod.FASTAPI_AVAILABLE:
         wanted.append(("Dashboard", cfg.get("api_host", "127.0.0.1"), cfg.get("api_port")))
     if cfg.get("status_enabled"):
         wanted.append(("Pagina di stato", cfg.get("status_host", "127.0.0.1"), cfg.get("status_port")))
@@ -270,7 +324,7 @@ def build_config(args) -> tuple[dict, str, Path]:
         # dati, cosi' la pagina Impostazioni della dashboard ha un file su cui
         # salvare e l'utente sa dove metterci le mani.
         config_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-    resolve_paths(cfg, data_dir)
+    resolve_paths(cfg, config_path)
     return cfg, str(config_path), data_dir
 
 
@@ -308,11 +362,18 @@ def main(argv=None) -> int:
         LOG.info("Cartella dati: %s (configurazione: %s)", data_dir, config_path)
 
         if not args.selftest and not guard.acquire():
-            show_message(WINDOW_TITLE,
-                         "Il middleware è già in esecuzione su questo computer.\n\n"
-                         f"L'interfaccia è disponibile su {_ui_url(cfg)}.")
-            LOG.warning("Avvio annullato: un'altra istanza e' gia' attiva.")
-            return 0
+            if guard.held_by_this_app():
+                show_message(WINDOW_TITLE,
+                             "Il middleware è già in esecuzione su questo computer.\n\n"
+                             f"L'interfaccia è disponibile su {_ui_url(cfg)}.")
+                LOG.warning("Avvio annullato: un'altra istanza e' gia' attiva.")
+                return 0
+            # La porta e' occupata da un programma estraneo: non e' una nostra
+            # istanza, quindi si prosegue (al massimo si perde il controllo di
+            # istanza singola, che e' meglio di un avvio impossibile).
+            LOG.warning("La porta di controllo %d e' occupata da un altro programma: "
+                        "controllo di istanza singola disattivato per questo avvio.",
+                        guard.port)
 
         occupied = busy_ports(cfg)
         if occupied:
@@ -327,6 +388,16 @@ def main(argv=None) -> int:
         url = service.ui_url
 
         if args.selftest:
+            if not url:
+                # Nessuna interfaccia configurata: il servizio e' comunque
+                # avviato, il selftest verifica quello e lo dice.
+                esito = "selftest: nessuna interfaccia configurata (api_enabled/status_enabled disattivi); servizio avviato -> OK"
+                LOG.info(esito)
+                try:
+                    print(esito)
+                except Exception:
+                    pass
+                return 0
             ok = service.wait_until_ready(timeout=20.0)
             esito = f"selftest: interfaccia su {url} -> {'OK' if ok else 'NON RAGGIUNGIBILE'}"
             LOG.info(esito)
@@ -337,7 +408,18 @@ def main(argv=None) -> int:
             return 0 if ok else 1
 
         if args.headless:
-            LOG.info("Modalita' headless: interfaccia su %s. Ctrl-C per fermare.", url)
+            LOG.info("Modalita' headless: %s. Ctrl-C per fermare.",
+                     f"interfaccia su {url}" if url else "nessuna interfaccia attiva")
+            _wait_forever(service)
+            return 0
+
+        if not url:
+            # Nessuna UI abilitata: dirlo e restare in servizio, invece di
+            # aprire un indirizzo che non risponde a nessuno.
+            LOG.warning("Nessuna interfaccia abilitata in configurazione: il servizio resta attivo.")
+            show_message(WINDOW_TITLE,
+                         "Il middleware è attivo, ma nessuna interfaccia è abilitata.\n\n"
+                         f"Attiva \"api_enabled\" o \"status_enabled\" in:\n{config_path}")
             _wait_forever(service)
             return 0
 
@@ -368,11 +450,8 @@ def main(argv=None) -> int:
 
 
 def _ui_url(cfg: dict) -> str:
-    host = cfg.get("api_host", "127.0.0.1") if cfg.get("api_enabled") else cfg.get("status_host", "127.0.0.1")
-    port = cfg.get("api_port", 8000) if cfg.get("api_enabled") else cfg.get("status_port", 8080)
-    if host in ("0.0.0.0", "::", ""):
-        host = "127.0.0.1"
-    return f"http://{host}:{port}"
+    """URL dell'interfaccia secondo la configurazione (senza avviare nulla)."""
+    return runmod.MiddlewareService(cfg).ui_url or "(nessuna interfaccia abilitata)"
 
 
 def _wait_forever(service) -> None:

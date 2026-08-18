@@ -73,7 +73,15 @@ def _read_config() -> dict:
     p = Path(_config_path)
     if p.exists():
         cfg.update(json.loads(p.read_text(encoding="utf-8")))
-    return cfg
+    # Stessa regola del servizio (run.resolve_config_paths): un percorso
+    # relativo si intende relativo al file di configurazione. Senza questo il
+    # pannello "Log applicativo" cercherebbe hl7mw.log nella directory di
+    # lavoro del processo — che con l'app desktop non e' quella dei dati —
+    # rispondendo 404 o mostrando un file di un'altra installazione.
+    # Import qui e non in testa: run.py importa api.py, un import circolare a
+    # livello di modulo si romperebbe a seconda di chi viene caricato per primo.
+    from . import run as runmod
+    return runmod.resolve_config_paths(cfg, _config_path)
 
 
 def _validate_config_update(payload: dict) -> dict:

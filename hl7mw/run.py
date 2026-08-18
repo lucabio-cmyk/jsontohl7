@@ -127,6 +127,32 @@ DEFAULTS = {
 }
 
 
+# Chiavi di configurazione che contengono un percorso su disco.
+PATH_KEYS = ("db_path", "log_file")
+# Valori che non sono percorsi anche se non sono assoluti (SQLite in memoria,
+# URI sqlite): vanno lasciati intatti.
+_NON_PATH_VALUES = (":memory:",)
+
+
+def resolve_config_paths(cfg: dict, config_path: str | None) -> dict:
+    """Rende assoluti (in-place) i percorsi relativi, rispetto al file di
+    configurazione che li contiene.
+
+    "Relativo al proprio file" e non "relativo alla directory corrente": la
+    directory corrente di un processo avviato da un'icona e' imprevedibile, e
+    componenti diversi (servizio, dashboard, CLI) la vedrebbero diversa,
+    finendo per scrivere e leggere file differenti con la stessa configurazione.
+    """
+    base = Path(config_path).expanduser().resolve().parent if config_path else Path.cwd()
+    for key in PATH_KEYS:
+        value = cfg.get(key)
+        if not value or value in _NON_PATH_VALUES or str(value).startswith("file:"):
+            continue
+        if not Path(value).is_absolute():
+            cfg[key] = str(base / value)
+    return cfg
+
+
 def load_config(path: str | None) -> dict:
     cfg = dict(DEFAULTS)
     if not path and Path("config.json").exists():
@@ -135,7 +161,7 @@ def load_config(path: str | None) -> dict:
         path = "config.json"
     if path:
         cfg.update(json.loads(Path(path).read_text(encoding="utf-8")))
-    return cfg
+    return resolve_config_paths(cfg, path)
 
 
 def resolve_vpn_health_check(cfg: dict) -> None:
@@ -178,18 +204,38 @@ class MiddlewareService:
         return bool(self.cfg.get("api_enabled")) and FASTAPI_AVAILABLE
 
     @property
-    def ui_url(self) -> str:
-        """URL dell'interfaccia da aprire: dashboard FastAPI se disponibile,
-        altrimenti la pagina di stato minimale."""
-        host = self.cfg.get("api_host", "127.0.0.1") if self.api_enabled else self.cfg.get("status_host", "127.0.0.1")
-        port = self.cfg.get("api_port", 8000) if self.api_enabled else self.cfg.get("status_port", 8080)
+    def ui_endpoint(self) -> tuple[str, int] | None:
+        """(host, porta) dell'interfaccia effettivamente avviata, None se non ce
+        n'e' nessuna (API non disponibile e pagina di stato disabilitata)."""
+        if self.api_enabled:
+            host, port = self.cfg.get("api_host", "127.0.0.1"), self.cfg.get("api_port", 8000)
+        elif self.cfg.get("status_enabled"):
+            host, port = self.cfg.get("status_host", "127.0.0.1"), self.cfg.get("status_port", 8080)
+        else:
+            return None
         # 0.0.0.0 e' un indirizzo di ascolto, non di connessione.
-        if host in ("0.0.0.0", "::", ""):
-            host = "127.0.0.1"
-        return f"http://{host}:{port}"
+        return ("127.0.0.1" if host in ("0.0.0.0", "::", "") else host), int(port)
+
+    @property
+    def ui_url(self) -> str:
+        """URL dell'interfaccia da aprire, stringa vuota se non ce n'e' una."""
+        endpoint = self.ui_endpoint
+        return f"http://{endpoint[0]}:{endpoint[1]}" if endpoint else ""
 
     # ----- avvio -----
     def start(self) -> "MiddlewareService":
+        """Avvia tutti i componenti. Se uno fallisce, quelli gia' avviati
+        vengono fermati prima di propagare l'errore: altrimenti resterebbero
+        listener aperti (e un tunnel VPN gestito da noi acceso) senza che il
+        chiamante abbia un riferimento su cui invocare stop()."""
+        try:
+            return self._start()
+        except Exception:
+            LOG.exception("Avvio fallito: fermo i componenti gia' avviati.")
+            self.stop()
+            raise
+
+    def _start(self) -> "MiddlewareService":
         cfg = self.cfg
         self.store = Store(cfg["db_path"])
         self.monitor = DeviceMonitor(self.store, cfg.get("device_offline_timeout_seconds", 300.0))
@@ -300,10 +346,12 @@ class MiddlewareService:
         mostrare: puntarla su un server non ancora in ascolto darebbe una
         pagina di errore che non si aggiorna da sola.
         """
-        host = self.cfg.get("api_host") if self.api_enabled else self.cfg.get("status_host")
-        port = self.cfg.get("api_port", 8000) if self.api_enabled else self.cfg.get("status_port", 8080)
-        if host in ("0.0.0.0", "::", ""):
-            host = "127.0.0.1"
+        endpoint = self.ui_endpoint
+        if endpoint is None:
+            LOG.info("Nessuna interfaccia configurata (api_enabled/status_enabled disattivi): "
+                     "il servizio lavora comunque, non c'e' nulla da aprire.")
+            return False
+        host, port = endpoint
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:

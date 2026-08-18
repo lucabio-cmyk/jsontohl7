@@ -12,6 +12,10 @@ Copre i modi in cui l'eseguibile "non funzionava" senza dirlo:
   6  catena dell'interfaccia: finestra embedded -> finestra applicazione -> browser
   7  avvio completo verificato end-to-end (--selftest)
   8  errore di avvio riportato all'utente, non solo in una console che sparisce
+ 9  si pretendono solo le porte dei servizi che partiranno davvero
+10  nessuna interfaccia abilitata: niente attese a vuoto su un indirizzo morto
+11  avvio parziale: i componenti gia' avviati vengono chiusi
+12  percorsi relativi ancorati al file di configurazione (servizio e dashboard)
 """
 import json
 import os
@@ -61,13 +65,14 @@ def test_data_dir(tmp: Path):
         check("1 Cartella dati non creabile -> errore esplicito con rimedio",
               "--data-dir" in str(e), str(e)[:80])
 
+    config_path = data_dir / "config.json"
     cfg = {"db_path": "hl7mw.db", "log_file": "hl7mw.log", "altro": "invariato"}
-    desktop.resolve_paths(cfg, data_dir)
-    check("2 db_path e log_file risolti dentro la cartella dati",
+    desktop.resolve_paths(cfg, config_path)
+    check("2 db_path e log_file risolti accanto al file di configurazione",
           cfg["db_path"] == str(data_dir / "hl7mw.db") and cfg["log_file"] == str(data_dir / "hl7mw.log"),
           str(cfg))
-    cfg_abs = {"db_path": str(tmp / "altrove.db")}
-    desktop.resolve_paths(cfg_abs, data_dir)
+    cfg_abs = {"db_path": str(tmp / "altrove.db"), "log_file": ":memory:"}
+    desktop.resolve_paths(cfg_abs, config_path)
     check("2 Un percorso gia' assoluto non viene toccato",
           cfg_abs["db_path"] == str(tmp / "altrove.db"))
 
@@ -97,10 +102,23 @@ def test_single_instance():
     check("4 La prima istanza prende il posto", first.acquire())
     second = desktop.SingleInstance(port=first.port)
     check("4 La seconda istanza riconosce che il posto e' occupato", not second.acquire())
+    check("4 ...e verifica che a tenerlo sia davvero il middleware", second.held_by_this_app())
     first.release()
     third = desktop.SingleInstance(port=first.port)
     check("4 Rilasciato il posto, una nuova istanza puo' partire", third.acquire())
     third.release()
+
+    # Porta occupata da un programma estraneo: non deve essere scambiata per
+    # un'istanza del middleware, altrimenti ogni avvio verrebbe annullato
+    # mandando l'utente su un'interfaccia inesistente.
+    port = free_port()
+    with socket.socket() as estraneo:
+        estraneo.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        estraneo.bind(("127.0.0.1", port))
+        estraneo.listen(1)
+        guard = desktop.SingleInstance(port=port)
+        check("4 Porta occupata da un estraneo: bind fallito ma nessun falso positivo",
+              not guard.acquire() and not guard.held_by_this_app())
 
 
 def test_busy_ports():
@@ -154,6 +172,102 @@ def test_ui_chain(tmp: Path):
               "--user-data-dir=" in args, args.strip())
     finally:
         os.environ["PATH"] = vecchio_path
+
+
+def test_ports_follow_what_starts(tmp: Path):
+    """La porta della dashboard e' richiesta solo se la dashboard partira'."""
+    port = free_port()
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
+        cfg = dict(runmod.DEFAULTS)
+        cfg.update({"order_listen_port": free_port(), "result_listen_port": free_port(),
+                    "api_enabled": True, "api_host": "127.0.0.1", "api_port": port,
+                    "status_enabled": False})
+        originale = runmod.FASTAPI_AVAILABLE
+        try:
+            runmod.FASTAPI_AVAILABLE = True
+            check("9 Con FastAPI disponibile la porta della dashboard e' richiesta",
+                  any(p == port for _, _, p in desktop.busy_ports(cfg)))
+            runmod.FASTAPI_AVAILABLE = False
+            check("9 Senza FastAPI la dashboard non parte: la sua porta non blocca l'avvio",
+                  desktop.busy_ports(cfg) == [], str(desktop.busy_ports(cfg)))
+        finally:
+            runmod.FASTAPI_AVAILABLE = originale
+
+
+def test_no_ui_configured(tmp: Path):
+    """Nessuna interfaccia abilitata: il servizio e' comunque valido, ma non si
+    aspetta a vuoto un indirizzo che non risponde a nessuno."""
+    cfg = dict(runmod.DEFAULTS)
+    cfg.update({"api_enabled": False, "status_enabled": False})
+    service = runmod.MiddlewareService(cfg)
+    check("10 Nessuna UI abilitata -> nessun endpoint da aprire",
+          service.ui_endpoint is None and service.ui_url == "", service.ui_url)
+    inizio = time.monotonic()
+    pronto = service.wait_until_ready(timeout=20.0)
+    check("10 wait_until_ready non aspetta il timeout se non c'e' nulla da attendere",
+          pronto is False and time.monotonic() - inizio < 1.0,
+          f"{pronto} in {time.monotonic() - inizio:.1f}s")
+
+    data_dir = tmp / "noui"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    config_path = data_dir / "config.json"
+    cfg_file = dict(runmod.DEFAULTS)
+    cfg_file.update({"api_enabled": False, "status_enabled": False, "log_console": False,
+                     "order_listen_port": free_port(), "result_listen_port": free_port()})
+    config_path.write_text(json.dumps(cfg_file), encoding="utf-8")
+    rc = desktop.main(["--selftest", "--data-dir", str(data_dir), "-c", str(config_path)])
+    check("10 --selftest senza interfaccia: esito positivo, non un falso fallimento", rc == 0, str(rc))
+
+
+def test_partial_start_rollback(tmp: Path):
+    """Se un listener fallisce, quelli gia' aperti vengono chiusi: altrimenti
+    resterebbero attivi senza che nessuno possa piu' fermarli."""
+    ordini = free_port()
+    occupata = free_port()
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", occupata))
+        s.listen(1)
+        cfg = dict(runmod.DEFAULTS)
+        cfg.update({"order_listen_port": ordini, "result_listen_port": occupata,
+                    "api_enabled": False, "status_enabled": False,
+                    "db_path": str(tmp / "rollback.db")})
+        service = runmod.MiddlewareService(cfg)
+        try:
+            service.start()
+            check("11 Avvio con porta occupata: l'errore viene propagato", False, "nessuna eccezione")
+        except OSError:
+            check("11 Avvio con porta occupata: l'errore viene propagato", True)
+    # La porta degli ordini, aperta prima del fallimento, deve essere stata chiusa
+    check("11 Il listener gia' avviato viene chiuso (nessuna porta orfana)",
+          desktop.port_is_free("0.0.0.0", ordini))
+
+
+def test_relative_paths_follow_config(tmp: Path):
+    """Percorsi relativi ancorati al file di configurazione: servizio e
+    dashboard devono vedere gli stessi file anche se lanciati da altrove."""
+    conf_dir = tmp / "altra-cartella"
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    config_path = conf_dir / "config.json"
+    config_path.write_text(json.dumps({"db_path": "hl7mw.db", "log_file": "hl7mw.log"}),
+                           encoding="utf-8")
+    cfg = runmod.load_config(str(config_path))
+    check("12 load_config risolve i relativi accanto al config, non nella cwd",
+          cfg["db_path"] == str(conf_dir / "hl7mw.db") and cfg["log_file"] == str(conf_dir / "hl7mw.log"),
+          f"{cfg['db_path']} | {cfg['log_file']}")
+
+    try:
+        from hl7mw import api
+    except ImportError:
+        print("[OK]     12 Coerenza con /api/logs: saltata (fastapi non installato)")
+        return
+    api.init_api(None, str(config_path), runmod.DEFAULTS)
+    letto = api._read_config()
+    check("12 La dashboard legge lo stesso percorso di log del servizio",
+          letto["log_file"] == cfg["log_file"], f"{letto['log_file']} vs {cfg['log_file']}")
 
 
 def test_selftest_end_to_end(tmp: Path):
@@ -219,6 +333,10 @@ def main() -> int:
         test_config_bootstrap(tmp)
         test_single_instance()
         test_busy_ports()
+        test_ports_follow_what_starts(tmp)
+        test_no_ui_configured(tmp)
+        test_partial_start_rollback(tmp)
+        test_relative_paths_follow_config(tmp)
         test_ui_chain(tmp)
         test_selftest_end_to_end(tmp)
         test_startup_error_is_reported(tmp)
